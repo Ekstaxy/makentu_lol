@@ -7,7 +7,7 @@ namespace Loupedeck.DemoPlugin
     internal static class CountdownState
     {
         private const Int32 StartSeconds = 10;
-        private const Int32 TimerCount = 10;
+        private const Int32 TimerCount = 5;  // 5v5: 5 enemies
 
         private static readonly Object LockObject = new Object();
         private static readonly Timer[] Timers;

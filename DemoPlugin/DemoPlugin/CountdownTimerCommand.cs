@@ -3,45 +3,39 @@ namespace Loupedeck.DemoPlugin
     using System;
     using System.Collections.Generic;
 
+    /// <summary>
+    /// Base class for the 5 enemy hero buttons on the Creative Console.
+    /// Each button shows the enemy hero image and a countdown overlay
+    /// when a summoner spell cooldown is triggered (e.g. TP, Flash).
+    /// </summary>
     public abstract class CountdownTimerCommandBase : PluginDynamicCommand
     {
         private const Int32 StartSeconds = 10;
-        private static readonly String[] CharacterNamesByTimerId =
+
+        // Fallback static hero names (overridden by dynamic config from UI).
+        private static readonly String[] FallbackHeroNames =
         {
             "蓋倫",
             "安妮",
             "好運姐",
             "阿姆姆",
             "雷歐娜",
-            "墨菲特",
-            "馬爾札哈",
-            "艾希",
-            "沃維克",
-            "索娜",
         };
 
         private readonly Int32 _timerId;
         private readonly Dictionary<Int32, String> _frameResources = new Dictionary<Int32, String>();
         private readonly Dictionary<String, String> _countdownOverlayResources = new Dictionary<String, String>();
-        private readonly String _characterResourcePath;
+        private String _characterResourcePath;
 
         protected CountdownTimerCommandBase(Int32 timerId, String displayName)
-            : base(displayName: displayName, description: "Counts down from 10 to 0", groupName: "Timers")
+            : base(displayName: displayName, description: "Enemy spell countdown", groupName: "Enemy Timers")
         {
             this._timerId = timerId;
-            if (timerId >= 1 && timerId <= CharacterNamesByTimerId.Length)
-            {
-                try
-                {
-                    this._characterResourcePath = PluginResources.FindFile($"{CharacterNamesByTimerId[timerId - 1]}_skills.png");
-                }
-                catch
-                {
-                    // Keep null and fall back to countdown frames.
-                }
-            }
 
-            // Load expected frame names explicitly so plugin load stays robust.
+            // Try loading character image from fallback names first.
+            TryLoadCharacterImage();
+
+            // Load countdown frame images.
             for (var seconds = 0; seconds <= StartSeconds; seconds++)
             {
                 var fileName = $"countdown_{seconds:00}.png";
@@ -89,6 +83,35 @@ namespace Loupedeck.DemoPlugin
             {
                 SignalBlockState.StateChanged += this.OnSignalStateChanged;
             }
+
+            // Listen for dynamic config changes to update hero image.
+            AllyChannelState.StateChanged += this.OnConfigChanged;
+        }
+
+        private void TryLoadCharacterImage()
+        {
+            // First try dynamic config.
+            var heroName = AllyChannelState.GetEnemyHero(this._timerId);
+
+            // Fallback to static list.
+            if (String.IsNullOrEmpty(heroName)
+                && this._timerId >= 1
+                && this._timerId <= FallbackHeroNames.Length)
+            {
+                heroName = FallbackHeroNames[this._timerId - 1];
+            }
+
+            if (!String.IsNullOrEmpty(heroName))
+            {
+                try
+                {
+                    this._characterResourcePath = PluginResources.FindFile($"{heroName}_skills.png");
+                }
+                catch
+                {
+                    this._characterResourcePath = null;
+                }
+            }
         }
 
         protected override void RunCommand(String actionParameter)
@@ -99,8 +122,13 @@ namespace Loupedeck.DemoPlugin
         protected override String GetCommandDisplayName(String actionParameter, PluginImageSize imageSize)
         {
             var (seconds, isRunning) = CountdownState.GetSnapshot(this._timerId);
-            var status = isRunning ? "Running" : (seconds == 0 ? "Done" : "Ready");
-            return $"T{this._timerId} {seconds}s ({status})";
+            var heroName = AllyChannelState.GetEnemyHero(this._timerId);
+            if (String.IsNullOrEmpty(heroName) && this._timerId >= 1 && this._timerId <= FallbackHeroNames.Length)
+                heroName = FallbackHeroNames[this._timerId - 1];
+
+            var label = String.IsNullOrEmpty(heroName) ? $"E{this._timerId}" : heroName;
+            var status = isRunning ? $"{seconds}s" : (seconds == 0 ? "Done" : "Ready");
+            return $"{label} ({status})";
         }
 
         protected override BitmapImage GetCommandImage(String actionParameter, PluginImageSize imageSize)
@@ -114,7 +142,6 @@ namespace Loupedeck.DemoPlugin
                     var compositeKey = $"{seconds:00}:{overlayKey}";
                     if (this._countdownOverlayResources.TryGetValue(compositeKey, out var overlayResourcePath))
                     {
-                        // Timer image stays the same; only corner pixels differ.
                         return PluginResources.ReadImage(overlayResourcePath);
                     }
                 }
@@ -130,7 +157,6 @@ namespace Loupedeck.DemoPlugin
                 return PluginResources.ReadImage(resourcePath);
             }
 
-            // Falls back to default icon template if the expected frame image is missing.
             return null;
         }
 
@@ -149,75 +175,39 @@ namespace Loupedeck.DemoPlugin
                 this.ActionImageChanged();
             }
         }
+
+        private void OnConfigChanged(Int32 slot)
+        {
+            // When enemy config changes, reload the hero image.
+            TryLoadCharacterImage();
+            this.ActionImageChanged();
+        }
     }
+
+    // ── 5 enemy hero timer buttons ──────────────────────────────
 
     public class CountdownTimer1Command : CountdownTimerCommandBase
     {
-        public CountdownTimer1Command() : base(1, "Countdown Timer 1")
-        {
-        }
+        public CountdownTimer1Command() : base(1, "Enemy Timer 1") { }
     }
 
     public class CountdownTimer2Command : CountdownTimerCommandBase
     {
-        public CountdownTimer2Command() : base(2, "Countdown Timer 2")
-        {
-        }
+        public CountdownTimer2Command() : base(2, "Enemy Timer 2") { }
     }
 
     public class CountdownTimer3Command : CountdownTimerCommandBase
     {
-        public CountdownTimer3Command() : base(3, "Countdown Timer 3")
-        {
-        }
+        public CountdownTimer3Command() : base(3, "Enemy Timer 3") { }
     }
 
     public class CountdownTimer4Command : CountdownTimerCommandBase
     {
-        public CountdownTimer4Command() : base(4, "Countdown Timer 4")
-        {
-        }
+        public CountdownTimer4Command() : base(4, "Enemy Timer 4") { }
     }
 
     public class CountdownTimer5Command : CountdownTimerCommandBase
     {
-        public CountdownTimer5Command() : base(5, "Countdown Timer 5")
-        {
-        }
-    }
-
-    public class CountdownTimer6Command : CountdownTimerCommandBase
-    {
-        public CountdownTimer6Command() : base(6, "Countdown Timer 6")
-        {
-        }
-    }
-
-    public class CountdownTimer7Command : CountdownTimerCommandBase
-    {
-        public CountdownTimer7Command() : base(7, "Countdown Timer 7")
-        {
-        }
-    }
-
-    public class CountdownTimer8Command : CountdownTimerCommandBase
-    {
-        public CountdownTimer8Command() : base(8, "Countdown Timer 8")
-        {
-        }
-    }
-
-    public class CountdownTimer9Command : CountdownTimerCommandBase
-    {
-        public CountdownTimer9Command() : base(9, "Countdown Timer 9")
-        {
-        }
-    }
-
-    public class CountdownTimer10Command : CountdownTimerCommandBase
-    {
-        public CountdownTimer10Command() : base(10, "Countdown Timer 10")
-        {
-        }
+        public CountdownTimer5Command() : base(5, "Enemy Timer 5") { }
     }
 }

@@ -1,0 +1,19 @@
+{
+  "server_ip": "172.20.10.2",
+  "server_port": 5005,
+  "my_role": "MID",
+  "my_hero": "安妮",
+  "allies": [
+    "JG",
+    "TOP",
+    "BOT",
+    "SUP"
+  ],
+  "enemies": [
+    "蓋倫",
+    "好運姐",
+    "阿姆姆",
+    "雷歐娜",
+    "墨菲特"
+  ]
+}
