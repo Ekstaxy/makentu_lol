@@ -6,14 +6,40 @@ namespace Loupedeck.DemoPlugin
     public abstract class CountdownTimerCommandBase : PluginDynamicCommand
     {
         private const Int32 StartSeconds = 10;
+        private static readonly String[] CharacterNamesByTimerId =
+        {
+            "蓋倫",
+            "安妮",
+            "好運姐",
+            "阿姆姆",
+            "雷歐娜",
+            "墨菲特",
+            "馬爾札哈",
+            "艾希",
+            "沃維克",
+            "索娜",
+        };
 
         private readonly Int32 _timerId;
         private readonly Dictionary<Int32, String> _frameResources = new Dictionary<Int32, String>();
+        private readonly Dictionary<String, String> _countdownOverlayResources = new Dictionary<String, String>();
+        private readonly String _characterResourcePath;
 
         protected CountdownTimerCommandBase(Int32 timerId, String displayName)
             : base(displayName: displayName, description: "Counts down from 10 to 0", groupName: "Timers")
         {
             this._timerId = timerId;
+            if (timerId >= 1 && timerId <= CharacterNamesByTimerId.Length)
+            {
+                try
+                {
+                    this._characterResourcePath = PluginResources.FindFile($"{CharacterNamesByTimerId[timerId - 1]}_skills.png");
+                }
+                catch
+                {
+                    // Keep null and fall back to countdown frames.
+                }
+            }
 
             // Load expected frame names explicitly so plugin load stays robust.
             for (var seconds = 0; seconds <= StartSeconds; seconds++)
@@ -30,7 +56,39 @@ namespace Loupedeck.DemoPlugin
                 }
             }
 
+            // Countdown overlays: same countdown base image, only corners differ.
+            var overlayKeys = new[]
+            {
+                "ur_y_br_none",
+                "ur_p_br_none",
+                "ur_none_br_g",
+                "ur_none_br_r",
+                "ur_y_br_g",
+                "ur_y_br_r",
+                "ur_p_br_g",
+                "ur_p_br_r",
+            };
+            foreach (var overlayKey in overlayKeys)
+            {
+                for (var seconds = 0; seconds <= StartSeconds; seconds++)
+                {
+                    var fileName = $"countdown_{seconds:00}_{overlayKey}.png";
+                    try
+                    {
+                        this._countdownOverlayResources[$"{seconds:00}:{overlayKey}"] = PluginResources.FindFile(fileName);
+                    }
+                    catch
+                    {
+                        // Optional asset; ignore if missing.
+                    }
+                }
+            }
+
             CountdownState.StateChanged += this.OnCountdownStateChanged;
+            if (this._timerId == 1)
+            {
+                SignalBlockState.StateChanged += this.OnSignalStateChanged;
+            }
         }
 
         protected override void RunCommand(String actionParameter)
@@ -48,6 +106,24 @@ namespace Loupedeck.DemoPlugin
         protected override BitmapImage GetCommandImage(String actionParameter, PluginImageSize imageSize)
         {
             var (seconds, _) = CountdownState.GetSnapshot(this._timerId);
+            if (this._timerId == 1)
+            {
+                var overlayKey = SignalBlockState.GetOverlayKey();
+                if (!String.Equals(overlayKey, "idle", StringComparison.OrdinalIgnoreCase))
+                {
+                    var compositeKey = $"{seconds:00}:{overlayKey}";
+                    if (this._countdownOverlayResources.TryGetValue(compositeKey, out var overlayResourcePath))
+                    {
+                        // Timer image stays the same; only corner pixels differ.
+                        return PluginResources.ReadImage(overlayResourcePath);
+                    }
+                }
+            }
+
+            if (!String.IsNullOrEmpty(this._characterResourcePath))
+            {
+                return PluginResources.ReadImage(this._characterResourcePath);
+            }
 
             if (this._frameResources.TryGetValue(seconds, out var resourcePath))
             {
@@ -61,6 +137,14 @@ namespace Loupedeck.DemoPlugin
         private void OnCountdownStateChanged(Int32 changedTimerId)
         {
             if (changedTimerId == this._timerId)
+            {
+                this.ActionImageChanged();
+            }
+        }
+
+        private void OnSignalStateChanged()
+        {
+            if (this._timerId == 1)
             {
                 this.ActionImageChanged();
             }

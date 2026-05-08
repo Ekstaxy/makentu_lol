@@ -25,12 +25,22 @@
     <None Remove="images\ThumbDown.png" />
     <None Remove="images\ThumbUp.png" />
     <None Remove="images\countdown\*.png" />
+    <None Remove="images\signals\*.png" />
+    <None Remove="images\countdown_signal\*.png" />
+    <None Remove="images\characters\*.png" />
+    <None Remove="images\characters_layout\*.png" />
+    <None Remove="images\characters_skills\*.png" />
   </ItemGroup>
 
   <ItemGroup>
     <EmbeddedResource Include="images\ThumbDown.png" />
     <EmbeddedResource Include="images\ThumbUp.png" />
     <EmbeddedResource Include="images\countdown\*.png" />
+    <EmbeddedResource Include="images\signals\*.png" />
+    <EmbeddedResource Include="images\countdown_signal\*.png" />
+    <EmbeddedResource Include="images\characters\*.png" />
+    <EmbeddedResource Include="images\characters_layout\*.png" />
+    <EmbeddedResource Include="images\characters_skills\*.png" />
   </ItemGroup>
 
   <ItemGroup>

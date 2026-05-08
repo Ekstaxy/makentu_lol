@@ -61,6 +61,7 @@ namespace Loupedeck.DemoPlugin
                 {
                     var result = await _udpClient.ReceiveAsync();
                     var message = Encoding.UTF8.GetString(result.Buffer).Trim();
+                    SignalBlockState.HandleSignal(message);
                     var timerId = ParseTimerId(message);
                     if (timerId.HasValue)
                     {
