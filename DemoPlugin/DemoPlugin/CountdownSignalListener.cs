@@ -10,6 +10,7 @@ namespace Loupedeck.DemoPlugin
     internal static class CountdownSignalListener
     {
         private const Int32 UdpPort = 5005;
+        private const Int32 MaxTimerId = 10;
 
         private static readonly Object LockObject = new Object();
 
@@ -60,11 +61,11 @@ namespace Loupedeck.DemoPlugin
                 {
                     var result = await _udpClient.ReceiveAsync();
                     var message = Encoding.UTF8.GetString(result.Buffer).Trim();
-
-                    if (message.Equals("START", StringComparison.OrdinalIgnoreCase))
+                    var timerId = ParseTimerId(message);
+                    if (timerId.HasValue)
                     {
-                        CountdownState.StartCountdown();
-                        PluginLog.Info($"Countdown started from UDP signal ({result.RemoteEndPoint})");
+                        CountdownState.StartCountdown(timerId.Value);
+                        PluginLog.Info($"Countdown T{timerId.Value} started from UDP signal ({result.RemoteEndPoint})");
                     }
                 }
                 catch (ObjectDisposedException)
@@ -76,6 +77,27 @@ namespace Loupedeck.DemoPlugin
                     PluginLog.Warning(ex, "Countdown signal listener error");
                 }
             }
+        }
+
+        private static Int32? ParseTimerId(String message)
+        {
+            if (message.Equals("START", StringComparison.OrdinalIgnoreCase))
+            {
+                return 1; // Backward-compatible default.
+            }
+
+            if (!message.StartsWith("START", StringComparison.OrdinalIgnoreCase))
+            {
+                return null;
+            }
+
+            var suffix = message.Substring(5).Trim();
+            if (Int32.TryParse(suffix, out var timerId) && timerId >= 1 && timerId <= MaxTimerId)
+            {
+                return timerId;
+            }
+
+            return null;
         }
     }
 }

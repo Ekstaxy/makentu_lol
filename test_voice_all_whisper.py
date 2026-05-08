@@ -3,6 +3,8 @@ import re
 import sys
 import os
 import time
+import subprocess
+from pathlib import Path
 import sounddevice as sd
 import numpy as np
 import keyboard
@@ -18,6 +20,11 @@ if not API_KEY:
     print("\n[錯誤] 請先設定環境變數 OPENAI_API_KEY")
     sys.exit(1)
 openai_client = OpenAI(api_key=API_KEY)
+BASE_DIR = Path(__file__).resolve().parent
+PIPELINE_JSON_PATH = BASE_DIR / "pipeline_payload.json"
+CLASSIFIER_SCRIPT_PATH = BASE_DIR / "message_classifier.py"
+OPENAI_TIMEOUT_SECONDS = 12
+CLASSIFIER_TIMEOUT_SECONDS = 8
 
 def rewrite_with_llm(raw_text):
     prompt = f"""
@@ -104,17 +111,31 @@ def analyze_voice_to_structured_json(raw_text):
        "target": "阿卡麗",
        "lol_slang_line": "阿卡麗在上草"
    }}
-
+6. 所有英雄名稱：（請只傳送中文名稱）
+    1. 蓋倫 Garen
+    2. 安妮 Annie
+    3. 好運姐 Miss Fortune
+    4. 阿姆姆 Amumu
+    5. 雷歐娜 Leona
+    6. 墨菲特 Malphite
+    7. 馬爾札哈 Malzahar
+    8. 艾希 Ashe
+    9. 沃維克 Warwick
+    10. 索娜 Sona
 使用者語音轉寫：
 「{raw_text}」
 """
     try:
+        t0 = time.time()
+        print("  [Pipeline] 開始呼叫 OpenAI 產生 JSON...")
         response = openai_client.chat.completions.create(
             model=MODEL_NAME,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=512,
             temperature=0.2,
+            timeout=OPENAI_TIMEOUT_SECONDS,
         )
+        print(f"  [Pipeline] OpenAI 完成，耗時 {time.time() - t0:.2f}s")
         raw = (response.choices[0].message.content or "").strip()
         blob = _extract_json_object(raw)
         if not blob:
@@ -138,6 +159,32 @@ def analyze_voice_to_structured_json(raw_text):
             "target": "",
             "lol_slang_line": slang,
         }
+
+
+def run_message_pipeline(payload):
+    """Save JSON payload and run message_classifier.py."""
+    PIPELINE_JSON_PATH.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print(f"  [Pipeline] JSON 已寫入：{PIPELINE_JSON_PATH}")
+
+    print("  [Pipeline] 執行 message_classifier.py...")
+    t0 = time.time()
+    result = subprocess.run(
+        [sys.executable, str(CLASSIFIER_SCRIPT_PATH), str(PIPELINE_JSON_PATH)],
+        capture_output=True,
+        text=True,
+        timeout=CLASSIFIER_TIMEOUT_SECONDS,
+    )
+    print(f"  [Pipeline] classifier 完成，耗時 {time.time() - t0:.2f}s")
+
+    if result.stdout.strip():
+        print(result.stdout.strip())
+    if result.returncode != 0:
+        if result.stderr.strip():
+            print(result.stderr.strip())
+        raise RuntimeError(f"message_classifier.py failed with exit code {result.returncode}")
 
 # ==========================================
 # ⚙️ 2. 初始化 Whisper 語音模型
@@ -227,23 +274,20 @@ try:
                         print("  [結構化 JSON]：")
                         print(json.dumps(payload, ensure_ascii=False, indent=2))
 
-                        lol_slang_text = payload.get("lol_slang_line")
-                        if not lol_slang_text and isinstance(payload.get("message"), dict):
-                            lol_slang_text = payload["message"].get("lol_slang_line")
-                        if not lol_slang_text:
-                            lol_slang_text = text
-                        print(f"  [送出遊戲內文字]：{lol_slang_text}")
-
-                        keyboard.send("enter")
-                        time.sleep(0.3)
-                        keyboard.write(lol_slang_text, delay=0.05)
-                        time.sleep(0.2)
-                        keyboard.send("enter")
+                        run_message_pipeline(payload)
+                    else:
+                        print("⚠️ Whisper 沒有辨識到有效文字。")
                 else:
                     print("⚠️ 錄音太短，已忽略。")
+            else:
+                print("⚠️ 沒有收到麥克風音訊（可能是權限或輸入裝置問題）。")
             
             # 辨識完畢後，稍微等一下避免連點
-            time.sleep(0.5)
+            while keyboard.is_pressed('shift'):
+                time.sleep(0.05)
+            time.sleep(0.2)
+        else:
+            time.sleep(0.05)
             
 except KeyboardInterrupt:
     print("\n\n程式已結束。")

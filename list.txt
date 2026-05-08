@@ -1,0 +1,14 @@
+Enemies:
+    1. 上路：蓋倫 Garen
+    2. 中路：安妮 Annie
+    3. 下路：好運姐 Miss Fortune
+    4. 打野：阿姆姆 Amumu
+    5. 輔助：雷歐娜 Leona
+
+
+Allies:
+    1. 上路：墨菲特 Malphite
+    2. 中路：馬爾札哈 Malzahar
+    3. 下路：艾希 Ashe
+    4. 打野：沃維克 Warwick
+    5. 輔助：索娜 Sona

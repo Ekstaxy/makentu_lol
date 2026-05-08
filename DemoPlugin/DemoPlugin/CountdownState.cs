@@ -1,69 +1,90 @@
 namespace Loupedeck.DemoPlugin
 {
     using System;
+    using System.Linq;
     using System.Timers;
 
     internal static class CountdownState
     {
         private const Int32 StartSeconds = 10;
+        private const Int32 TimerCount = 10;
 
         private static readonly Object LockObject = new Object();
-        private static readonly Timer Timer;
+        private static readonly Timer[] Timers;
 
-        private static Int32 _remainingSeconds = StartSeconds;
-        private static Boolean _isRunning;
+        private static readonly Int32[] RemainingSeconds = Enumerable.Repeat(StartSeconds, TimerCount).ToArray();
+        private static readonly Boolean[] IsRunning = new Boolean[TimerCount];
 
         static CountdownState()
         {
-            Timer = new Timer(1000);
-            Timer.AutoReset = true;
-            Timer.Elapsed += OnTimerElapsed;
-        }
-
-        public static event Action StateChanged;
-
-        public static void StartCountdown()
-        {
-            lock (LockObject)
+            Timers = new Timer[TimerCount];
+            for (var timerId = 1; timerId <= TimerCount; timerId++)
             {
-                _remainingSeconds = StartSeconds;
-                _isRunning = true;
-                Timer.Start();
-            }
-
-            RaiseStateChanged();
-        }
-
-        public static (Int32 Seconds, Boolean IsRunning) GetSnapshot()
-        {
-            lock (LockObject)
-            {
-                return (_remainingSeconds, _isRunning);
+                var capturedId = timerId;
+                var timer = new Timer(1000);
+                timer.AutoReset = true;
+                timer.Elapsed += (_, __) => OnTimerElapsed(capturedId);
+                Timers[timerId - 1] = timer;
             }
         }
 
-        private static void OnTimerElapsed(Object sender, ElapsedEventArgs e)
+        public static event Action<Int32> StateChanged;
+
+        public static void StartCountdown(Int32 timerId)
         {
+            var index = ValidateTimerId(timerId);
             lock (LockObject)
             {
-                if (!_isRunning)
+                RemainingSeconds[index] = StartSeconds;
+                IsRunning[index] = true;
+                Timers[index].Start();
+            }
+
+            RaiseStateChanged(timerId);
+        }
+
+        public static (Int32 Seconds, Boolean IsRunning) GetSnapshot(Int32 timerId)
+        {
+            var index = ValidateTimerId(timerId);
+            lock (LockObject)
+            {
+                return (RemainingSeconds[index], IsRunning[index]);
+            }
+        }
+
+        private static void OnTimerElapsed(Int32 timerId)
+        {
+            var index = ValidateTimerId(timerId);
+            lock (LockObject)
+            {
+                if (!IsRunning[index])
                 {
                     return;
                 }
 
-                _remainingSeconds--;
-                if (_remainingSeconds <= 0)
+                RemainingSeconds[index]--;
+                if (RemainingSeconds[index] <= 0)
                 {
-                    _remainingSeconds = 0;
-                    _isRunning = false;
-                    Timer.Stop();
+                    RemainingSeconds[index] = 0;
+                    IsRunning[index] = false;
+                    Timers[index].Stop();
                 }
             }
 
-            RaiseStateChanged();
+            RaiseStateChanged(timerId);
         }
 
-        private static void RaiseStateChanged()
-            => StateChanged?.Invoke();
+        private static Int32 ValidateTimerId(Int32 timerId)
+        {
+            if (timerId < 1 || timerId > TimerCount)
+            {
+                throw new ArgumentOutOfRangeException(nameof(timerId), $"Timer id must be 1-{TimerCount}");
+            }
+
+            return timerId - 1;
+        }
+
+        private static void RaiseStateChanged(Int32 timerId)
+            => StateChanged?.Invoke(timerId);
     }
 }
