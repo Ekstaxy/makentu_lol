@@ -1,7 +1,6 @@
 import json
 import random
 import shutil
-import subprocess
 import time
 import urllib3
 from pathlib import Path
@@ -19,8 +18,6 @@ SRC_SPELL_DIR = ROOT_IMAGES_DIR / "skills"
 OUT_CHAMPION_DIR = OUT_INFO_DIR / "champion"
 OUT_SPELL_DIR = OUT_INFO_DIR / "spell"
 LIVE_WAIT_TIMEOUT_SEC = 5
-DEMO_PLUGIN_ROOT = ROOT_IMAGES_DIR.parent  # .../DemoPlugin/DemoPlugin
-SOLUTION_DIR = DEMO_PLUGIN_ROOT.parent      # .../DemoPlugin
 
 
 def get_live_data():
@@ -75,30 +72,6 @@ def copy_assets(result):
             shutil.copy(src, dst)
         else:
             print(f"[warn] spell image not found: {SRC_SPELL_DIR / (s + '.png/.PNG')}")
-
-
-def rebuild_and_restart_logi():
-    print("=== rebuilding plugin ===")
-    try:
-        subprocess.run(
-            ["dotnet", "build", "DemoPlugin.sln"],
-            cwd=str(SOLUTION_DIR),
-            check=True,
-        )
-    except subprocess.CalledProcessError as e:
-        print(f"[error] dotnet build failed: {e}")
-        return
-    except FileNotFoundError:
-        print("[error] dotnet not found in PATH")
-        return
-
-    print("=== restarting Logi Options+ / service ===")
-    try:
-        subprocess.run(["pkill", "-f", "Logi Options+"], check=False)
-        subprocess.run(["pkill", "-f", "LogiPluginService"], check=False)
-        subprocess.run(["open", "-a", "Logi Options+"], check=False)
-    except Exception as e:
-        print(f"[warn] restart command failed: {e}")
 
 
 def list_image_stems(folder: Path):
@@ -194,7 +167,6 @@ if __name__ == "__main__":
                     OUT_JSON.write_text(json.dumps(result, ensure_ascii=False, indent=4), encoding="utf-8")
                     copy_assets(result)
                     print(f"wrote {OUT_JSON}")
-                    rebuild_and_restart_logi()
                     break
         elif time.time() - started_at >= LIVE_WAIT_TIMEOUT_SEC:
             print(f"[timeout] no live API within {LIVE_WAIT_TIMEOUT_SEC}s, generating random test data...")
@@ -203,6 +175,5 @@ if __name__ == "__main__":
             OUT_JSON.write_text(json.dumps(result, ensure_ascii=False, indent=4), encoding="utf-8")
             copy_assets(result)
             print(f"wrote fallback test JSON: {OUT_JSON}")
-            rebuild_and_restart_logi()
             break
         time.sleep(1)
