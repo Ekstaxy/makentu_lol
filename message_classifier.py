@@ -73,8 +73,17 @@ def _send_udp_json(host: str, port: int, payload: Dict[str, Any]) -> None:
         sock.sendto(json.dumps(payload, ensure_ascii=False).encode("utf-8"), (host, port))
 
 
-def _send_countdown_start(host: str, port: int, timer_id: int) -> None:
-    signal = f"START{timer_id}".encode("utf-8")
+def _send_countdown_start(
+    host: str, port: int, timer_id: int, skill: str | None = None
+) -> None:
+    """Notify the Logi plugin countdown. Use skill 'teleport' for 傳送, 'flash' or None for 閃現 (legacy STARTn)."""
+    if skill == "teleport":
+        text = f"START{timer_id}T"
+    elif skill == "flash":
+        text = f"START{timer_id}F"
+    else:
+        text = f"START{timer_id}"
+    signal = text.encode("utf-8")
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
         sock.sendto(signal, (host, port))
 
@@ -117,11 +126,23 @@ def classify_and_route(
         _send_udp_json(countdown_host, countdown_port, status_payload)
         print(f"Sent countdown payload to {countdown_host}:{countdown_port} -> {status_payload}")
 
-        # 3) Trigger mapped countdown timer for this target.
+        # 3) Trigger mapped skill cooldown for this target (flash vs teleport are separate).
         timer_id = HERO_TIMER_MAP.get(target)
         if timer_id is not None:
-            _send_countdown_start(countdown_host, countdown_port, timer_id)
-            print(f"Sent countdown signal START{timer_id} for target {target}")
+            cd_skill: str | None
+            if skill == "teleport":
+                cd_skill = "teleport"
+            elif skill == "flash":
+                cd_skill = "flash"
+            else:
+                cd_skill = None
+            _send_countdown_start(
+                countdown_host, countdown_port, timer_id, skill=cd_skill
+            )
+            suffix = "T" if cd_skill == "teleport" else ("F" if cd_skill == "flash" else "")
+            print(
+                f"Sent countdown START{timer_id}{suffix or ''} (skill={skill}) for target {target}"
+            )
         else:
             print(f"No countdown mapping found for target: {target}")
         return
