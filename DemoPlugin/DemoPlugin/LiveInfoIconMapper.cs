@@ -21,6 +21,54 @@ namespace Loupedeck.DemoPlugin
             // Mapping is now read directly from JSON on every icon render.
         }
 
+        /// <summary>
+        /// True when mirrored lol_live_info.json exists, parses, status is In Game, and both teams have roster entries.
+        /// </summary>
+        public static Boolean TryIsGameUiReady()
+        {
+            var path = ResolveLiveInfoJsonPath();
+            if (String.IsNullOrEmpty(path) || !File.Exists(path))
+            {
+                return false;
+            }
+
+            try
+            {
+                var json = File.ReadAllText(path);
+                using var doc = JsonDocument.Parse(json);
+                var root = doc.RootElement;
+                if (!root.TryGetProperty("status", out var st) || st.ValueKind != JsonValueKind.String)
+                {
+                    return false;
+                }
+
+                if (!String.Equals(st.GetString(), "In Game", StringComparison.Ordinal))
+                {
+                    return false;
+                }
+
+                if (!root.TryGetProperty("theirTeam", out var their)
+                    || their.ValueKind != JsonValueKind.Array
+                    || their.GetArrayLength() < 1)
+                {
+                    return false;
+                }
+
+                if (!root.TryGetProperty("myTeam", out var mine)
+                    || mine.ValueKind != JsonValueKind.Array
+                    || mine.GetArrayLength() < 1)
+                {
+                    return false;
+                }
+
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
         public static Boolean TryGetSlotResources(Int32 timerId, out Byte[] championBytes, out Byte[] spell1Bytes, out Byte[] spell2Bytes)
         {
             championBytes = null;
@@ -36,6 +84,37 @@ namespace Loupedeck.DemoPlugin
             spell1Bytes = LoadImageBytes(visual.Spell1);
             spell2Bytes = LoadImageBytes(visual.Spell2);
             return championBytes != null || spell1Bytes != null || spell2Bytes != null;
+        }
+
+        /// <summary>
+        /// One line for PiP overlay when an enemy spell countdown finishes (timers 1–5).
+        /// Uses live champion / spell display names from lol_live_info.json when available.
+        /// </summary>
+        public static Boolean TryFormatEnemyCooldownReadyLine(Int32 timerId, CountdownSkill skill, out String line)
+        {
+            line = null;
+            if (timerId < 1 || timerId > 5)
+            {
+                return false;
+            }
+
+            if (!TryGetSlotVisual(timerId, out var visual) || visual == null)
+            {
+                return false;
+            }
+
+            var champ = (visual.Champion ?? String.Empty).Trim();
+            if (String.IsNullOrEmpty(champ))
+            {
+                return false;
+            }
+
+            String skillLabel = skill == CountdownSkill.Flash
+                ? (String.IsNullOrWhiteSpace(visual.Spell1) ? "閃現" : visual.Spell1.Trim())
+                : (String.IsNullOrWhiteSpace(visual.Spell2) ? "傳送" : visual.Spell2.Trim());
+
+            line = $"敵方 {champ} · {skillLabel} 已恢復";
+            return true;
         }
 
         private static Boolean TryGetSlotVisual(Int32 timerId, out SlotVisual visual)

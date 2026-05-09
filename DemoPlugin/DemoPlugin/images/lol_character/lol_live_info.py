@@ -230,6 +230,11 @@ if __name__ == "__main__":
                             "spell1": p.get("summonerSpells", {}).get("summonerSpellOne", {}).get("displayName"),
                             "spell2": p.get("summonerSpells", {}).get("summonerSpellTwo", {}).get("displayName"),
                         }
+                        for lane_key in ("teamPosition", "individualPosition", "position", "lane"):
+                            if lane_key in p:
+                                val = p.get(lane_key)
+                                if val is not None and str(val).strip() != "":
+                                    p_info[lane_key] = val
                         side = "myTeam" if p.get("team") == my_team_id else "theirTeam"
                         result[side].append(p_info)
 

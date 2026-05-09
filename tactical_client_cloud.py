@@ -7,8 +7,8 @@ tactical_client_cloud.py — Central tactical voice client.
   - Tap the Windows key (press then release) to record up to 3s for Whisper / AI
     (ends early on trailing silence); communication stays always-on
   - Whisper + OpenAI run on each completed PTT clip
-  - After AI JSON: runs message_classifier.py (same as test_voice_all_whisper.py) —
-    RPi UDP, local countdown UDP to Loupedeck, in-game chat via keyboard
+  - After AI JSON: runs message_classifier.py — RPi UDP, local countdown UDP to Loupedeck;
+    chat text goes to optional PiP overlay UDP (pip_message_overlay.py), not League chat when enabled
 
 Usage:
     python tactical_client_cloud.py
@@ -28,6 +28,12 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+import math
+import glob
+import ctypes
+from ctypes import wintypes
+import obsws_python as obs
+import cv2
 
 import numpy as np
 import sounddevice as sd
@@ -35,6 +41,8 @@ import whisper
 from openai import OpenAI
 
 from openai_key_util import load_openai_api_key
+
+from overlay_udp import send_overlay_line
 
 # =====================================================================
 # ⚙️  Configuration
@@ -46,6 +54,26 @@ CONFIG_PATH = BASE_DIR / "tactical_config.json"
 def _die(msg: str) -> None:
     print(msg, file=sys.stderr)
     sys.exit(1)
+
+
+def _config_opt_int(raw: dict, key: str, default: int) -> int:
+    v = raw.get(key)
+    if v is None:
+        return default
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _config_opt_float(raw: dict, key: str, default: float) -> float:
+    v = raw.get(key)
+    if v is None:
+        return default
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
 
 
 def load_config_or_exit() -> dict:
@@ -102,6 +130,38 @@ def load_config_or_exit() -> dict:
             _die(f'[錯誤] tactical_config.json enemies[{i}] 不可為空。')
         enemies_out.append(s)
 
+    pip_port_raw = raw.get("pip_overlay_udp_port")
+    pip_overlay_udp_port = 0
+    if pip_port_raw is not None:
+        try:
+            pip_overlay_udp_port = int(pip_port_raw)
+        except (TypeError, ValueError):
+            pip_overlay_udp_port = 0
+    pip_overlay_host = str(raw.get("pip_overlay_host", "127.0.0.1")).strip() or "127.0.0.1"
+    if "pip_overlay_whisper" in raw:
+        pw = raw.get("pip_overlay_whisper")
+        if isinstance(pw, bool):
+            pip_overlay_whisper = pw
+        else:
+            pip_overlay_whisper = str(pw).strip().lower() in ("1", "true", "yes")
+    else:
+        pip_overlay_whisper = pip_overlay_udp_port > 0
+
+    pa = raw.get("pip_overlay_autostart", True)
+    if isinstance(pa, bool):
+        pip_overlay_autostart = pa
+    elif isinstance(pa, str):
+        pip_overlay_autostart = pa.strip().lower() in ("1", "true", "yes")
+    else:
+        pip_overlay_autostart = True
+
+    # Defaults sized to sit over LoL client chat (bottom-left); tune if resolution/HUD scale differs.
+    pip_overlay_width = _config_opt_int(raw, "pip_overlay_width", 300)
+    pip_overlay_height = _config_opt_int(raw, "pip_overlay_height", 130)
+    pip_overlay_x = _config_opt_int(raw, "pip_overlay_x", 35)
+    pip_overlay_y = _config_opt_int(raw, "pip_overlay_y", 370)
+    pip_overlay_idle_seconds = _config_opt_float(raw, "pip_overlay_idle_seconds", 5.0)
+
     return {
         "server_ip":   str(ip).strip(),
         "server_port": udp_port,
@@ -109,6 +169,19 @@ def load_config_or_exit() -> dict:
         "my_hero":     str(hero).strip(),
         "allies":      allies_out,
         "enemies":     enemies_out,
+        "obs_host":    raw.get("obs_host", "localhost"),
+        "obs_port":    int(raw.get("obs_port", 4455)),
+        "obs_password": raw.get("obs_password", "9ECzI8cnMbWWjLx9"),
+        "video_save_dir": raw.get("video_save_dir", "D:/obs-studio/video"),
+        "pip_overlay_host":       pip_overlay_host,
+        "pip_overlay_udp_port":   pip_overlay_udp_port,
+        "pip_overlay_whisper":    pip_overlay_whisper,
+        "pip_overlay_autostart":  pip_overlay_autostart,
+        "pip_overlay_width":      pip_overlay_width,
+        "pip_overlay_height":     pip_overlay_height,
+        "pip_overlay_x":          pip_overlay_x,
+        "pip_overlay_y":          pip_overlay_y,
+        "pip_overlay_idle_seconds": pip_overlay_idle_seconds,
     }
 
 
@@ -118,6 +191,86 @@ RPI_IP            = config["server_ip"]
 UDP_PORT          = config["server_port"]
 LOCAL_IPC_PORT    = 5006   # Loupedeck plugin → this client
 LOCAL_PLUGIN_PORT = 5005   # this client → Loupedeck plugin
+
+# =====================================================================
+# ⚙️  OBS & Replay config
+# =====================================================================
+OBS_HOST          = config["obs_host"]
+OBS_PORT          = config["obs_port"]
+OBS_PASSWORD      = config["obs_password"]
+VIDEO_SAVE_DIR    = config["video_save_dir"]
+
+PIP_OVERLAY_HOST    = config["pip_overlay_host"]
+PIP_OVERLAY_PORT    = config["pip_overlay_udp_port"]
+PIP_OVERLAY_WHISPER = config["pip_overlay_whisper"]
+PIP_OVERLAY_AUTOSTART = config["pip_overlay_autostart"]
+
+
+def _udp_port_available(port: int) -> bool:
+    """True if nothing is bound to UDP port (same check as pip_message_overlay bind)."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.bind(("0.0.0.0", port))
+        s.close()
+        return True
+    except OSError:
+        return False
+
+
+def _maybe_autostart_pip_overlay() -> None:
+    """Spawn pip_message_overlay.py so the Tk window appears without a second manual terminal."""
+    if PIP_OVERLAY_PORT <= 0 or not PIP_OVERLAY_AUTOSTART:
+        return
+    script = BASE_DIR / "pip_message_overlay.py"
+    if not script.is_file():
+        print(f"[警告] 找不到 {script}，無法自動開啟 PiP 視窗。")
+        return
+    if not _udp_port_available(PIP_OVERLAY_PORT):
+        print(
+            f"[PiP] UDP 埠 {PIP_OVERLAY_PORT} 已被占用，略過自動啟動"
+            f"（可能已有 pip_message_overlay 在跑）。"
+        )
+        return
+    try:
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                str(script),
+                "--udp-port",
+                str(PIP_OVERLAY_PORT),
+                "--width",
+                str(config["pip_overlay_width"]),
+                "--height",
+                str(config["pip_overlay_height"]),
+                "--x",
+                str(config["pip_overlay_x"]),
+                "--y",
+                str(config["pip_overlay_y"]),
+                "--idle-seconds",
+                str(config["pip_overlay_idle_seconds"]),
+            ],
+            cwd=str(BASE_DIR),
+        )
+        print(f"[PiP] 已自動啟動浮動視窗 (子程序 PID {proc.pid})。")
+    except OSError as e:
+        print(f"[警告] 自動啟動 PiP 視窗失敗: {e}")
+
+
+if PIP_OVERLAY_PORT > 0:
+    print(f"📺 PiP overlay → UDP {PIP_OVERLAY_HOST}:{PIP_OVERLAY_PORT}")
+    _maybe_autostart_pip_overlay()
+    if not PIP_OVERLAY_AUTOSTART:
+        print(
+            f"   （pip_overlay_autostart=false，請手動: python pip_message_overlay.py "
+            f"--udp-port {PIP_OVERLAY_PORT}）"
+        )
+
+FORCE_WINDOW_FOREGROUND = True
+WINDOW_POS_X = 0
+WINDOW_POS_Y = 0
+
+_replay_lock = threading.Lock()
+_replay_playing = False
 
 def _new_provisional_router_role() -> str:
     """Unique id for HELLO before / without lane sync (Z + 7 hex)."""
@@ -418,6 +571,12 @@ def build_liveinfo_result_from_allgamedata(data: dict):
             .get("summonerSpellTwo", {})
             .get("displayName"),
         }
+        # Lane keys vary by client/API revision; match extract_my_lane_role_from_allgamedata.
+        for lane_key in ("teamPosition", "individualPosition", "position", "lane"):
+            if lane_key in p:
+                val = p.get(lane_key)
+                if val is not None and str(val).strip() != "":
+                    p_info[lane_key] = val
         side = "myTeam" if p.get("team") == my_team_id else "theirTeam"
         result[side].append(p_info)
     return result
@@ -904,7 +1063,7 @@ def analyze_voice_to_payloads(raw_text: str):
 2. 每個事件必須包含鍵：kind, target, lol_slang_line。
 3. 欄位：
    - kind：chat | status_report
-   - target：這句話的主要目標（英雄/玩家/路線/物件），例如「阿璃」；若無明確目標請填空字串
+   - target：這句話的主要目標（英雄名稱，或路線角色語如中路／打野／ADC／下路／輔助／上路），也可為玩家/路線/物件；例如「阿璃」或「中路」；若無明確目標請填空字串
    - lol_slang_line：台服極簡術語一行（極短、無多餘標點，符合遊戲內打字習慣）
 4. 術語與糾錯沿用台服習慣（江山/较少→交閃語境、大爷→打野、没伞→沒閃、小时→消失、车队→撤退等）。
 5. 範例1：
@@ -930,8 +1089,12 @@ def analyze_voice_to_payloads(raw_text: str):
 {hero_list}
 8. 可用技能名稱（優先使用以下名稱做糾錯與歸一化）：
    {SKILL_NAMES_PROMPT}
+9. 若出現技能名稱，則一定是 status_report 的 kind。
 
-使用者語音轉寫：
+使用者語音轉寫，注意諧音字不同也可算作同一英雄，例如：
+-潘森與攀升
+-回家與維迦
+-庫奇與酷奇
 「{raw_text}」"""
 
     try:
@@ -966,16 +1129,26 @@ def run_message_pipeline(payloads):
         )
         print(f"  [Pipeline] JSON({idx}/{len(payloads)}) → {PIPELINE_JSON_PATH.name}")
 
+        cmd = [
+            sys.executable,
+            str(CLASSIFIER_SCRIPT_PATH),
+            str(PIPELINE_JSON_PATH),
+            "--rpi-ip",
+            RPI_IP,
+            "--rpi-port",
+            str(UDP_PORT),
+        ]
+        if PIP_OVERLAY_PORT > 0:
+            cmd.extend(
+                [
+                    "--overlay-host",
+                    PIP_OVERLAY_HOST,
+                    "--overlay-port",
+                    str(PIP_OVERLAY_PORT),
+                ]
+            )
         result = subprocess.run(
-            [
-                sys.executable,
-                str(CLASSIFIER_SCRIPT_PATH),
-                str(PIPELINE_JSON_PATH),
-                "--rpi-ip",
-                RPI_IP,
-                "--rpi-port",
-                str(UDP_PORT),
-            ],
+            cmd,
             capture_output=True,
             text=True,
             timeout=CLASSIFIER_TIMEOUT_SECONDS,
@@ -1004,6 +1177,8 @@ def voice_analysis_pipeline(audio_np: np.ndarray):
             return
 
         print(f"[Whisper] {text}  ({time.time() - t0:.1f}s)")
+        if PIP_OVERLAY_PORT > 0 and PIP_OVERLAY_WHISPER:
+            send_overlay_line(PIP_OVERLAY_HOST, PIP_OVERLAY_PORT, f"[辨識] {text}")
 
         # Step 1: quick correction + hotkey trigger
         hotkey_text = text
@@ -1077,6 +1252,382 @@ def _send_local_signal(signal_text: str):
 
 
 # =====================================================================
+# 💀  Death Replay System
+# =====================================================================
+def _try_force_foreground(window_title: str) -> None:
+    if not FORCE_WINDOW_FOREGROUND:
+        return
+    try:
+        user32 = ctypes.windll.user32
+        user32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+        user32.FindWindowW.restype = wintypes.HWND
+        hwnd = user32.FindWindowW(None, window_title)
+        if not hwnd:
+            return
+        SW_SHOWNORMAL = 1
+        HWND_TOPMOST = -1
+        SWP_NOSIZE = 0x0001
+        SWP_NOMOVE = 0x0002
+        SWP_SHOWWINDOW = 0x0040
+
+        user32.ShowWindow(hwnd, SW_SHOWNORMAL)
+        user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW)
+        user32.SetForegroundWindow(hwnd)
+    except Exception:
+        pass
+
+def save_obs_replay():
+    try:
+        client = obs.ReqClient(host=OBS_HOST, port=OBS_PORT, password=OBS_PASSWORD)
+        client.save_replay_buffer()
+        print("[OBS] 成功送出儲存 30 秒重播指令！")
+        try:
+            client.disconnect()
+        except Exception:
+            pass
+        
+        time.sleep(1.5)
+        
+        list_of_files = glob.glob(f"{VIDEO_SAVE_DIR}/*.mkv")
+        if not list_of_files: list_of_files = glob.glob(f"{VIDEO_SAVE_DIR}/*.mp4")
+        if not list_of_files: list_of_files = glob.glob(f"{VIDEO_SAVE_DIR}/*.flv")
+            
+        if not list_of_files:
+            print(f"\n[致命錯誤] 在 {VIDEO_SAVE_DIR} 找不到任何影片！")
+            return None
+            
+        latest_file = max(list_of_files, key=os.path.getctime)
+        print(f"[系統] 找到最新重播影片: {latest_file}")
+
+        stable_checks = 0
+        last_size = -1
+        deadline = time.time() + 10.0
+        while time.time() < deadline:
+            try:
+                size = os.path.getsize(latest_file)
+                if size > 0 and size == last_size:
+                    stable_checks += 1
+                    if stable_checks >= 2:
+                        break
+                else:
+                    stable_checks = 0
+                    last_size = size
+            except FileNotFoundError:
+                stable_checks = 0
+                last_size = -1
+            time.sleep(0.5)
+
+        cap = cv2.VideoCapture(latest_file)
+        if cap.isOpened():
+            cap.release()
+        else:
+            cap.release()
+            time.sleep(1.5)
+
+        return latest_file
+    except Exception as e:
+        print(f"[錯誤] OBS 連線或存檔失敗: {e}")
+        return None
+
+def play_video_in_floating_window(video_path):
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print("[錯誤] 無法讀取影片檔")
+        return
+
+    window_name = f"Death Replay [pid:{os.getpid()}_{int(time.time())}]"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, 799, 469)
+    cv2.setWindowProperty(window_name, cv2.WND_PROP_TOPMOST, 1)
+    try:
+        cv2.moveWindow(window_name, int(WINDOW_POS_X), int(WINDOW_POS_Y))
+    except Exception:
+        pass
+    _try_force_foreground(window_name)
+
+    def window_alive() -> bool:
+        try:
+            return cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) >= 1.0
+        except Exception:
+            return False
+
+    def safe_set_trackbar_pos(name: str, pos: int) -> None:
+        try:
+            if not window_alive():
+                return
+            nonlocal _suppress_trackbar_callback
+            _suppress_trackbar_callback = True
+            cv2.setTrackbarPos(name, window_name, int(pos))
+            _suppress_trackbar_callback = False
+        except cv2.error:
+            try:
+                _suppress_trackbar_callback = False
+            except Exception:
+                pass
+            return
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+    delay = int(1000 / fps) if fps > 0 else 30
+
+    target_seconds = 30.0
+    end_frame = max(0, total_frames - 1)
+
+    duration_seconds = 0.0
+    end_ms = 0.0
+    try:
+        cap.set(cv2.CAP_PROP_POS_AVI_RATIO, 1.0)
+        cap.grab()
+        end_ms = float(cap.get(cv2.CAP_PROP_POS_MSEC) or 0.0)
+    except Exception:
+        end_ms = 0.0
+
+    if end_ms > 0:
+        duration_seconds = end_ms / 1000.0
+    elif fps > 0 and total_frames > 0:
+        duration_seconds = total_frames / fps
+
+    if end_ms > 0:
+        segment_duration_seconds = min(target_seconds, duration_seconds) if duration_seconds > 0 else target_seconds
+        segment_duration_seconds = max(0.0, float(segment_duration_seconds))
+        segment_seconds = int(math.ceil(segment_duration_seconds)) if segment_duration_seconds > 0 else 30
+        
+        segment_end_seconds = duration_seconds if duration_seconds > 0 else (end_ms / 1000.0)
+        segment_start_seconds = max(0.0, segment_end_seconds - segment_duration_seconds)
+        start_ms = max(0.0, end_ms - (segment_duration_seconds * 1000.0))
+        cap.set(cv2.CAP_PROP_POS_MSEC, start_ms)
+        start_frame = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+    else:
+        segment_duration_seconds = target_seconds
+        segment_seconds = int(math.ceil(segment_duration_seconds))
+        segment_end_seconds = target_seconds
+        segment_start_seconds = 0.0
+        start_frame = max(0, end_frame - int(max(1.0, fps) * 30) + 1) if total_frames > 0 else 0
+
+    def seek_to_segment_start():
+        if total_frames > 0:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        elif duration_seconds > 0:
+            cap.set(cv2.CAP_PROP_POS_MSEC, segment_start_seconds * 1000.0)
+        else:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+    seek_to_segment_start()
+
+    play_start_perf = time.perf_counter()
+    paused_total_seconds = 0.0
+    paused_at_perf = None
+    _suppress_trackbar_callback = False
+
+    def on_trackbar(val):
+        nonlocal _suppress_trackbar_callback, is_paused
+        if _suppress_trackbar_callback:
+            return
+        remaining_seconds = int(val)
+
+        if duration_seconds > 0:
+            target_pos_seconds = max(0.0, duration_seconds - float(remaining_seconds))
+            target_pos_seconds = max(segment_start_seconds, min(segment_end_seconds, target_pos_seconds))
+
+            cap.set(cv2.CAP_PROP_POS_MSEC, segment_start_seconds * 1000.0)
+            target_ms = target_pos_seconds * 1000.0
+            while True:
+                cur_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+                if cur_ms >= target_ms - 100:
+                    break
+                ret = cap.grab()
+                if not ret:
+                    break
+        elif fps > 0:
+            target_frame = end_frame - int(remaining_seconds * fps)
+            target_frame = max(start_frame, min(end_frame, target_frame))
+
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+            while True:
+                cur_f = cap.get(cv2.CAP_PROP_POS_FRAMES)
+                if cur_f >= target_frame - 1:
+                    break
+                ret = cap.grab()
+                if not ret:
+                    break
+        else:
+            return
+
+        nonlocal play_start_perf, paused_total_seconds, paused_at_perf
+        now = time.perf_counter()
+        if duration_seconds > 0:
+            cur_ms = cap.get(cv2.CAP_PROP_POS_MSEC) or 0.0
+            video_elapsed = max(0.0, (cur_ms / 1000.0) - segment_start_seconds)
+        else:
+            cur_frame = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+            video_elapsed = max(0.0, (cur_frame - start_frame) / fps) if fps > 0 else 0.0
+        play_start_perf = now - paused_total_seconds - video_elapsed
+        if paused_at_perf is not None:
+            paused_at_perf = now
+
+        if is_paused:
+            ret, frame = cap.read()
+            if ret:
+                frame_resized = cv2.resize(frame, (799, 469))
+                if duration_seconds > 0:
+                    cur_ms = float(cap.get(cv2.CAP_PROP_POS_MSEC) or 0.0)
+                    rem_s = max(0.0, (end_ms - cur_ms) / 1000.0)
+                else:
+                    cur_frame = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+                    rem_s = max(0.0, segment_duration_seconds - max(0.0, (cur_frame - start_frame) / fps))
+                text = f"Remaining: {rem_s:.1f} s"
+                cv2.putText(frame_resized, text, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 3, cv2.LINE_AA)
+                cv2.imshow(window_name, frame_resized)
+
+    try:
+        cv2.createTrackbar('Remain(s)', window_name, segment_seconds, segment_seconds, on_trackbar)
+    except cv2.error:
+        pass
+
+    print("[播放器] 開始播放死亡重播...")
+    is_paused = False
+    last_space_down = False
+    last_space_toggle_perf = 0.0
+    click_toggle_requested = False
+
+    def on_mouse(event, x, y, flags, param):
+        nonlocal click_toggle_requested
+        if event == cv2.EVENT_LBUTTONDOWN:
+            click_toggle_requested = True
+
+    cv2.setMouseCallback(window_name, on_mouse)
+
+    try:
+        import keyboard  # type: ignore
+    except Exception:
+        keyboard = None
+
+    while cap.isOpened():
+        if not window_alive():
+            break
+        if not is_paused:
+            now = time.perf_counter()
+            elapsed = now - play_start_perf - paused_total_seconds
+
+            ret, frame = cap.read()
+            if not ret:
+                cap.release()
+                cap = cv2.VideoCapture(video_path)
+                if not cap.isOpened():
+                    break
+                seek_to_segment_start()
+                play_start_perf = time.perf_counter()
+                paused_total_seconds = 0.0
+                paused_at_perf = None
+                safe_set_trackbar_pos('Remain(s)', segment_seconds)
+                continue
+
+            current_frame = int(cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
+            frame_resized = cv2.resize(frame, (799, 469))
+            
+            if end_ms > 0:
+                cur_ms = float(cap.get(cv2.CAP_PROP_POS_MSEC) or 0.0)
+                remaining_time_s = max(0.0, (end_ms - cur_ms) / 1000.0)
+                trackbar_val = int(math.ceil(remaining_time_s))
+            else:
+                remaining_time_s = max(0.0, segment_duration_seconds - elapsed)
+                trackbar_val = int(math.ceil(remaining_time_s))
+                
+            trackbar_val = max(0, min(segment_seconds, trackbar_val))
+            
+            text = f"Remaining: {remaining_time_s:.1f} s"
+            cv2.putText(frame_resized, text, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 3, cv2.LINE_AA)
+            cv2.imshow(window_name, frame_resized)
+
+            if (current_frame % 15) == 0:
+                _try_force_foreground(window_name)
+
+            safe_set_trackbar_pos('Remain(s)', trackbar_val)
+
+        wait_time = 15 if is_paused else delay
+        key = cv2.waitKey(wait_time) & 0xFF
+
+        space_pressed = (key == ord(' '))
+        if keyboard is not None:
+            s_down = keyboard.is_pressed('space')
+            if s_down and not last_space_down:
+                space_pressed = True
+            last_space_down = s_down
+
+        if click_toggle_requested:
+            space_pressed = True
+            click_toggle_requested = False
+
+        now = time.perf_counter()
+        if space_pressed and (now - last_space_toggle_perf) > 0.25:
+            last_space_toggle_perf = now
+            is_paused = not is_paused
+            if is_paused:
+                paused_at_perf = now
+            else:
+                if paused_at_perf is not None:
+                    paused_total_seconds += now - paused_at_perf
+                paused_at_perf = None
+
+    cap.release()
+    try:
+        cv2.destroyWindow(window_name)
+    except Exception:
+        pass
+    
+    for _ in range(10):
+        cv2.waitKey(10)
+        
+    print("[播放器] 重播結束，關閉視窗。")
+
+def trigger_death_replay():
+    global _replay_playing
+    with _replay_lock:
+        if _replay_playing:
+            print("[系統] 重播播放中，忽略本次觸發。")
+            return
+        _replay_playing = True
+    try:
+        print("\n💀 [影像辨識/API] 偵測到玩家陣亡！啟動重播機制...")
+        latest_video = save_obs_replay()
+        if latest_video:
+            play_video_in_floating_window(latest_video)
+    finally:
+        with _replay_lock:
+            _replay_playing = False
+
+def death_monitor_loop():
+    print("💀 死亡偵測機制已啟動，等待觸發...")
+    prev_dead = None
+    while is_running:
+        try:
+            data = get_allgamedata()
+            if data:
+                active_player = data.get('activePlayer', {})
+                my_name = active_player.get('summonerName', '')
+                all_players = data.get('allPlayers', [])
+
+                is_dead = None
+                for p in all_players:
+                    if p.get('summonerName', '') == my_name:
+                        is_dead = p.get('isDead', False)
+                        break
+
+                if is_dead is not None:
+                    if prev_dead is not None and is_dead != prev_dead:
+                        if is_dead:
+                            print("💀 你死亡了！")
+                            trigger_death_replay()
+                        else:
+                            print("✨ 你復活了！")
+                    prev_dead = is_dead
+            time.sleep(1)
+        except Exception as e:
+            # Silence expected API connection errors during polling
+            time.sleep(1)
+
+
+# =====================================================================
 # 🏁  Main
 # =====================================================================
 print(f"\n🌐 連接至 RPi 路由器 ({RPI_IP}:{UDP_PORT})")
@@ -1136,6 +1687,7 @@ print(f"🎮 場次設定已更新: {MY_HERO} vs {', '.join(ENEMIES)}")
 
 liveinfo_ready.set()
 threading.Thread(target=_preload, daemon=True).start()
+threading.Thread(target=death_monitor_loop, daemon=True).start()
 
 try:
     print("\n✅ 系統已啟動！")

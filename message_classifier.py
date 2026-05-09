@@ -8,6 +8,8 @@ from typing import Any, Dict
 
 import keyboard
 
+from overlay_udp import send_overlay_line
+
 
 # Network defaults (override with CLI flags if needed).
 DEFAULT_RPI_IP = "172.20.10.2"
@@ -39,7 +41,7 @@ SKILL_SYNONYMS = {
     "cleanse": {"cleanse", "淨化"},
     "barrier": {"barrier", "光盾"},
     "ignite": {"ignite", "點燃", "點人"},
-    "smite": {"smite", "重擊"},
+    "smite": {"smite", "重擊", "中級", "終極"},
     "ghost": {"ghost", "鬼步"},
     "exhaust": {"exhaust", "虛弱"},
 }
@@ -177,20 +179,160 @@ def _normalize_skill_text(text: str) -> str:
     return raw
 
 
+def _live_json_has_enemy_lane_hints(data: Dict[str, Any]) -> bool:
+    """True if theirTeam rows include any non-empty Riot lane field (lane routing needs this)."""
+    for pl in data.get("theirTeam", [])[:5]:
+        if not isinstance(pl, dict):
+            continue
+        for k in ("teamPosition", "individualPosition", "position", "lane"):
+            v = pl.get(k)
+            if v is None:
+                continue
+            s = str(v).strip().upper()
+            if s and s not in ("NONE", "INVALID", "LANE_NONE"):
+                return True
+    return False
+
+
 def _resolve_live_info_path() -> Path | None:
-    best = None
-    best_t = -1.0
+    """Prefer newest file; if multiple candidates, prefer JSON that includes enemy lane fields."""
+    scored: list[tuple[int, float, Path]] = []
     for p in _live_info_candidate_paths():
         if not p.is_file():
             continue
         try:
             t = p.stat().st_mtime
-        except OSError:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
             continue
-        if t >= best_t:
-            best_t = t
-            best = p
-    return best
+        tier = 1 if _live_json_has_enemy_lane_hints(data) else 0
+        scored.append((tier, t, p))
+    if not scored:
+        return None
+    scored.sort(key=lambda x: (x[0], x[1]))
+    return scored[-1][2]
+
+
+def _read_live_json_dict() -> Dict[str, Any] | None:
+    """Fresh lol_live_info.json dict for lane routing; None if missing/unreadable."""
+    p = _resolve_live_info_path()
+    if p is None:
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _normalize_riot_lane(raw: str) -> str | None:
+    """Map Live Client position strings to canonical lane keys (aligned with tactical_client_cloud)."""
+    if not raw:
+        return None
+    u = str(raw).strip().upper().replace(" ", "").replace("_", "")
+    if u in ("NONE", "INVALID", "LANE_NONE", ""):
+        return None
+    aliases = {
+        "TOP": "TOP",
+        "MIDDLE": "MIDDLE",
+        "MID": "MIDDLE",
+        "MIDDLELANE": "MIDDLE",
+        "MIDLANER": "MIDDLE",
+        "JUNGLE": "JUNGLE",
+        "JUNGLER": "JUNGLE",
+        "JG": "JUNGLE",
+        "JGL": "JUNGLE",
+        "JUN": "JUNGLE",
+        "BOTTOM": "BOTTOM",
+        "BOT": "BOTTOM",
+        "ADC": "BOTTOM",
+        "DUO": "BOTTOM",
+        "DUOCARRY": "BOTTOM",
+        "UTILITY": "UTILITY",
+        "SUPPORT": "UTILITY",
+        "SUP": "UTILITY",
+    }
+    if u in aliases:
+        return aliases[u]
+    if "JUNGLE" in u or u in ("JGL", "JG") or u.endswith("JG"):
+        return "JUNGLE"
+    if "MIDDLE" in u or "MIDLANE" in u:
+        return "MIDDLE"
+    if "BOTTOM" in u or u == "ADC" or ("DUO" in u and "CARRY" in u):
+        return "BOTTOM"
+    if "UTILITY" in u or "SUPPORT" in u:
+        return "UTILITY"
+    return None
+
+
+def _canonical_lane_from_target_phrase(target: str) -> str | None:
+    """Detect lane role phrase (Traditional Chinese / English) in target text."""
+    t = (target or "").strip()
+    if not t:
+        return None
+    tl = t.lower()
+    # Longer / specific substrings first (Chinese).
+    zh_checks = [
+        ("中路", "MIDDLE"),
+        ("中單", "MIDDLE"),
+        ("打野", "JUNGLE"),
+        ("野區", "JUNGLE"),
+        ("上路", "TOP"),
+        ("上單", "TOP"),
+        ("下路輔", "UTILITY"),
+        ("下路", "BOTTOM"),
+        ("射手", "BOTTOM"),
+        ("輔助", "UTILITY"),
+    ]
+    for needle, lane in zh_checks:
+        if needle in t:
+            return lane
+    eng_ordered = [
+        ("middle", "MIDDLE"),
+        ("mid", "MIDDLE"),
+        ("jungle", "JUNGLE"),
+        ("jg", "JUNGLE"),
+        ("bottom", "BOTTOM"),
+        ("adc", "BOTTOM"),
+        ("support", "UTILITY"),
+        ("utility", "UTILITY"),
+        ("sup", "UTILITY"),
+        ("top", "TOP"),
+    ]
+    for needle, lane in eng_ordered:
+        if needle in tl:
+            return lane
+    return None
+
+
+def _enemy_slot_info_from_lane(data: Dict[str, Any], canonical_lane: str) -> Dict[str, Any] | None:
+    """Match enemy timer 1–5 by normalized lane vs theirTeam positions."""
+    for idx, player in enumerate(data.get("theirTeam", [])[:5], start=1):
+        pos = (
+            player.get("teamPosition")
+            or player.get("individualPosition")
+            or player.get("position")
+            or player.get("lane")
+            or ""
+        )
+        n = _normalize_riot_lane(str(pos))
+        if n == canonical_lane:
+            return {
+                "timer_id": idx,
+                "spell1": str(player.get("spell1", "")).strip(),
+                "spell2": str(player.get("spell2", "")).strip(),
+                "is_me": False,
+            }
+    return None
+
+
+def _enemy_timer_from_lane_keyword(target: str) -> Dict[str, Any] | None:
+    canon = _canonical_lane_from_target_phrase(target)
+    if canon is None:
+        return None
+    data = _read_live_json_dict()
+    if not data:
+        return None
+    return _enemy_slot_info_from_lane(data, canon)
 
 
 def _read_live_slot_map() -> Dict[str, Dict[str, Any]]:
@@ -249,8 +391,8 @@ def _read_live_slot_map() -> Dict[str, Dict[str, Any]]:
 
 def _resolve_timer_and_skill_channel(target: str, inferred_skill: str) -> tuple[int | None, str | None]:
     """
-    Resolve countdown target from lol_live_info, then tactical_config enemies,
-    then HERO_TIMER_MAP. Returns (timer_id, cd_channel) where channel is
+    Resolve countdown target from lol_live_info (champion match, then lane phrase vs enemy positions),
+    then tactical_config enemies, then HERO_TIMER_MAP. Returns (timer_id, cd_channel) where channel is
     'flash' -> STARTnF, 'teleport' -> STARTnT, None -> STARTn legacy.
     """
     target = (target or "").strip()
@@ -270,6 +412,10 @@ def _resolve_timer_and_skill_channel(target: str, inferred_skill: str) -> tuple[
 
     if info is not None:
         return _live_slot_skill_channel(info, inferred)
+
+    lane_info = _enemy_timer_from_lane_keyword(target)
+    if lane_info is not None:
+        return _live_slot_skill_channel(lane_info, inferred)
 
     slot = _enemy_slot_from_tactical_config(target)
     if slot is not None:
@@ -310,8 +456,15 @@ def _send_countdown_start(
         sock.sendto(signal, (host, port))
 
 
-def _send_chat_to_game(lol_slang_text: str) -> None:
-    # Keep the exact send flow used in test_voice_all_whisper.py (237-241).
+def _send_chat_to_game(
+    lol_slang_text: str,
+    overlay_host: str = "127.0.0.1",
+    overlay_port: int = 0,
+) -> None:
+    """PiP overlay UDP when overlay_port > 0; else legacy League chat typing."""
+    if overlay_port > 0:
+        send_overlay_line(overlay_host, overlay_port, lol_slang_text)
+        return
     keyboard.send("enter")
     time.sleep(0.3)
     keyboard.write(lol_slang_text, delay=0.05)
@@ -325,6 +478,8 @@ def classify_and_route(
     rpi_port: int,
     countdown_host: str,
     countdown_port: int,
+    overlay_host: str = "127.0.0.1",
+    overlay_port: int = 0,
 ) -> None:
     kind = _get_field(payload, "kind").lower()
     if not kind:
@@ -374,8 +529,11 @@ def classify_and_route(
                 print(
                     f"[Fallback->chat] no countdown mapping for target='{target}' skill='{skill}', sending chat."
                 )
-                _send_chat_to_game(slang)
-                print(f"Sent chat to game: {slang}")
+                _send_chat_to_game(slang, overlay_host, overlay_port)
+                if overlay_port > 0:
+                    print(f"Sent to PiP overlay: {slang}")
+                else:
+                    print(f"Sent chat to game: {slang}")
             else:
                 print(
                     f"No countdown mapping found for target='{target}' and no chat text available."
@@ -385,8 +543,11 @@ def classify_and_route(
     if kind == "chat":
         if not slang:
             raise ValueError("chat payload missing 'lol_slang_line'")
-        _send_chat_to_game(slang)
-        print(f"Sent chat to game: {slang}")
+        _send_chat_to_game(slang, overlay_host, overlay_port)
+        if overlay_port > 0:
+            print(f"Sent to PiP overlay: {slang}")
+        else:
+            print(f"Sent chat to game: {slang}")
         return
 
     raise ValueError(f"Unsupported kind: {kind}")
@@ -399,6 +560,17 @@ def main() -> None:
     parser.add_argument("--rpi-port", type=int, default=DEFAULT_RPI_PORT, help="RPi UDP port.")
     parser.add_argument("--countdown-host", default=DEFAULT_COUNTDOWN_HOST, help="Countdown host.")
     parser.add_argument("--countdown-port", type=int, default=DEFAULT_COUNTDOWN_PORT, help="Countdown UDP port.")
+    parser.add_argument(
+        "--overlay-host",
+        default="127.0.0.1",
+        help="PiP overlay UDP host (pip_message_overlay.py).",
+    )
+    parser.add_argument(
+        "--overlay-port",
+        type=int,
+        default=0,
+        help="PiP overlay UDP port; 0 = type chat in League instead.",
+    )
     args = parser.parse_args()
 
     with open(args.json_file, "r", encoding="utf-8") as f:
@@ -414,6 +586,8 @@ def main() -> None:
             rpi_port=args.rpi_port,
             countdown_host=args.countdown_host,
             countdown_port=args.countdown_port,
+            overlay_host=args.overlay_host,
+            overlay_port=args.overlay_port,
         )
 
 
