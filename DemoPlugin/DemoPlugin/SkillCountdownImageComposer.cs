@@ -51,24 +51,31 @@ namespace Loupedeck.DemoPlugin
         public static BitmapImage TryBuild(
             Int32 timerId,
             Byte[] characterPngBytes,
+            Byte[] topSkillPngBytes,
+            Byte[] bottomSkillPngBytes,
             Int32 flashSeconds,
             Boolean flashRunning,
             Int32 teleportSeconds,
             Boolean teleportRunning,
             String signalOverlayKey)
         {
-            Image<Rgba32> image;
+            Image<Rgba32> character;
             try
             {
-                image = Image.Load<Rgba32>(characterPngBytes);
+                character = Image.Load<Rgba32>(characterPngBytes);
             }
             catch
             {
                 return null;
             }
 
-            using (image)
+            using (character)
             {
+                using var image = new Image<Rgba32>(100, 100, new Rgba32(0, 0, 0, 0));
+                DrawLayer(image, character, new Rectangle(0, 0, 70, 100));
+                DrawLayer(image, topSkillPngBytes, new Rectangle(70, 0, 30, 50));
+                DrawLayer(image, bottomSkillPngBytes, new Rectangle(70, 50, 30, 50));
+
                 if (timerId >= 1 && timerId <= 5)
                 {
                     // Slight red tint on the character region for timers 1-5.
@@ -154,6 +161,33 @@ namespace Loupedeck.DemoPlugin
         private static void FillCorner(Image<Rgba32> image, Single x, Single y, Single w, Single h, Color color)
         {
             image.Mutate(ctx => ctx.Fill(color, new RectangleF(x, y, w, h)));
+        }
+
+        private static void DrawLayer(Image<Rgba32> target, Byte[] pngBytes, Rectangle area)
+        {
+            if (pngBytes == null || pngBytes.Length == 0)
+            {
+                return;
+            }
+
+            try
+            {
+                using var src = Image.Load<Rgba32>(pngBytes);
+                DrawLayer(target, src, area);
+            }
+            catch
+            {
+            }
+        }
+
+        private static void DrawLayer(Image<Rgba32> target, Image<Rgba32> src, Rectangle area)
+        {
+            using var resized = src.Clone(ctx => ctx.Resize(new ResizeOptions
+            {
+                Size = new Size(area.Width, area.Height),
+                Mode = ResizeMode.Stretch,
+            }));
+            target.Mutate(ctx => ctx.DrawImage(resized, new Point(area.X, area.Y), 1f));
         }
 
         private static Image<Rgba32> ApplyInsetScale(Image<Rgba32> source, Single scale, Rgba32 backgroundColor)

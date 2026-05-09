@@ -21,7 +21,9 @@ namespace Loupedeck.DemoPlugin
 
         private readonly Int32 _timerId;
         private readonly Dictionary<Int32, String> _frameResources = new Dictionary<Int32, String>();
-        private readonly Byte[] _characterSkillImageBytes;
+        private readonly Byte[] _characterImageBytes;
+        private readonly Byte[] _topSkillImageBytes;
+        private readonly Byte[] _bottomSkillImageBytes;
 
         protected CountdownTimerCommandBase(Int32 timerId, String displayName)
             : base(displayName: displayName, description: "閃現 / 傳送 各一組倒數", groupName: "Timers")
@@ -31,18 +33,14 @@ namespace Loupedeck.DemoPlugin
             Byte[] characterBytes = null;
             if (timerId >= 1 && timerId <= CharacterNamesByTimerId.Length)
             {
-                try
-                {
-                    var resourcePath = PluginResources.FindFile($"{CharacterNamesByTimerId[timerId - 1]}_skills.png");
-                    characterBytes = PluginResources.ReadBinaryFile(resourcePath);
-                }
-                catch
-                {
-                    characterBytes = null;
-                }
+                characterBytes = LoadResourceBytes(
+                    $"{CharacterNamesByTimerId[timerId - 1]}.png",
+                    $"{CharacterNamesByTimerId[timerId - 1]}_70.png");
             }
 
-            this._characterSkillImageBytes = characterBytes;
+            this._characterImageBytes = characterBytes;
+            this._topSkillImageBytes = LoadResourceBytes("閃現.png", "閃現.PNG");
+            this._bottomSkillImageBytes = LoadResourceBytes("傳送.PNG", "傳送.png");
 
             for (var seconds = 0; seconds <= 10; seconds++)
             {
@@ -80,11 +78,13 @@ namespace Loupedeck.DemoPlugin
             var (tSec, tRun) = CountdownState.GetSnapshot(this._timerId, CountdownSkill.Teleport);
             var overlayKey = SignalBlockState.GetOverlayKey();
 
-            if (this._characterSkillImageBytes != null && this._characterSkillImageBytes.Length > 0)
+            if (this._characterImageBytes != null && this._characterImageBytes.Length > 0)
             {
                 var composed = SkillCountdownImageComposer.TryBuild(
                     this._timerId,
-                    this._characterSkillImageBytes,
+                    this._characterImageBytes,
+                    this._topSkillImageBytes,
+                    this._bottomSkillImageBytes,
                     fSec,
                     fRun,
                     tSec,
@@ -100,6 +100,22 @@ namespace Loupedeck.DemoPlugin
             if (this._frameResources.TryGetValue(frameSec, out var resourcePath))
             {
                 return PluginResources.ReadImage(resourcePath);
+            }
+
+            return null;
+        }
+
+        private static Byte[] LoadResourceBytes(params String[] candidates)
+        {
+            foreach (var candidate in candidates)
+            {
+                try
+                {
+                    return PluginResources.ReadBinaryFile(PluginResources.FindFile(candidate));
+                }
+                catch
+                {
+                }
             }
 
             return null;

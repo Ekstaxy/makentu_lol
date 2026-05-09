@@ -33,6 +33,7 @@
     <None Remove="images\characters\*.png" />
     <None Remove="images\characters_layout\*.png" />
     <None Remove="images\characters_skills\*.png" />
+    <None Remove="images\skills\*.*" />
   </ItemGroup>
 
   <ItemGroup>
@@ -44,6 +45,7 @@
     <EmbeddedResource Include="images\characters\*.png" />
     <EmbeddedResource Include="images\characters_layout\*.png" />
     <EmbeddedResource Include="images\characters_skills\*.png" />
+    <EmbeddedResource Include="images\skills\*.*" />
   </ItemGroup>
 
   <ItemGroup>
