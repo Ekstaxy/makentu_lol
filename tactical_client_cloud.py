@@ -285,7 +285,7 @@ ENEMIES  = config["enemies"]
 
 CHANNELS = 1
 RATE     = 16000
-CHUNK    = 1024   # ~64 ms per callback block
+CHUNK    = 512   # ~64 ms per callback block
 
 # =====================================================================
 # ⚙️  Win-key PTT capture (tunable)
@@ -1027,6 +1027,27 @@ def audio_mixer_loop():
             pass
 
 
+def _resolve_remote_alert_timer(hero: str, skill: str) -> tuple[int | None, str]:
+    """Resolve timer_id + effective skill for a remote CMD:ENEMY_ALERT.
+
+    First tries the fast path (direct ENEMIES list match), then falls back to
+    message_classifier._resolve_timer_and_skill_channel which understands both
+    champion names and lane-role phrases like 中路 / 打野 / TOP etc.
+    """
+    timer_id = _hero_to_timer_id(hero)
+    if timer_id is not None:
+        return timer_id, skill
+
+    # Lane-name / fuzzy champion resolution via message_classifier (same logic
+    # used by the sender when it built the alert).
+    try:
+        import message_classifier as _mc
+        tid, resolved_skill = _mc._resolve_timer_and_skill_channel(hero, skill)
+        return tid, (resolved_skill or skill)
+    except Exception:
+        return None, skill
+
+
 def handle_incoming_command(data: bytes):
     try:
         cmd_text = data.decode("utf-8")
@@ -1040,13 +1061,15 @@ def handle_incoming_command(data: bytes):
                 return
             hero  = alert.get("which character", "")
             skill = alert.get("which skill", "flash")
-            timer_id = _hero_to_timer_id(hero)
+            timer_id, effective_skill = _resolve_remote_alert_timer(hero, skill)
             if timer_id is not None:
-                signal = (f"START{timer_id}T" if skill == "teleport" else
-                          f"START{timer_id}F" if skill == "flash"    else
+                signal = (f"START{timer_id}T" if effective_skill == "teleport" else
+                          f"START{timer_id}F" if effective_skill == "flash"    else
                           f"START{timer_id}")
                 _send_local_signal(signal)
                 print(f"📥 Remote alert: {hero} ({skill}) → {signal}")
+            else:
+                print(f"📥 Remote alert received but no timer mapping for: {hero!r}")
         else:
             _send_local_signal(cmd_text)
 
@@ -1187,6 +1210,52 @@ def analyze_voice_to_payloads(raw_text: str):
         return [{"kind": "chat", "target": "", "lol_slang_line": slang}]
 
 
+def _infer_skill_from_slang(slang: str) -> str:
+    """Quick skill inference from lol_slang_line for the broadcast payload.
+
+    Mirrors the most common cases from message_classifier._infer_skill; the
+    full version with details dict is only needed by the local classifier.
+    """
+    s = slang.lower()
+    if "沒閃" in slang or "交閃" in slang or "no flash" in s:
+        return "flash"
+    if "沒傳" in slang or "沒tp" in s or "no tp" in s:
+        return "teleport"
+    if "沒大" in slang or "no r" in s:
+        return "ultimate"
+    if "沒治" in slang:
+        return "heal"
+    if "沒淨化" in slang:
+        return "cleanse"
+    if "沒虛弱" in slang or "no exhaust" in s:
+        return "exhaust"
+    if "沒光盾" in slang or "no barrier" in s:
+        return "barrier"
+    if "沒點燃" in slang or "no ignite" in s:
+        return "ignite"
+    if "沒鬼步" in slang or "no ghost" in s:
+        return "ghost"
+    return "unknown"
+
+
+def _broadcast_enemy_alert(target: str, skill: str) -> None:
+    """Broadcast CMD:ENEMY_ALERT via the router using the already-registered sock.
+
+    message_classifier.py sends this payload in a subprocess with a fresh
+    unregistered socket, so the router drops it.  We re-send it here from the
+    main registered socket so the router will forward it to all teammates.
+    """
+    if not target:
+        return
+    try:
+        alert   = {"which character": target, "which skill": skill}
+        packet  = ("CMD:ENEMY_ALERT:" + json.dumps(alert, ensure_ascii=False)).encode("utf-8")
+        sock.sendto(packet, (RPI_IP, UDP_PORT))
+        print(f"📤 廣播技能警報給隊友: {alert}")
+    except Exception as e:
+        print(f"[warn] 廣播 enemy alert 失敗: {e}")
+
+
 def run_message_pipeline(payloads):
     """Write pipeline_payload.json and run message_classifier.py — same as test_voice_all_whisper."""
     for idx, payload in enumerate(payloads, start=1):
@@ -1226,6 +1295,16 @@ def run_message_pipeline(payloads):
             if result.stderr.strip():
                 print(result.stderr.strip())
             print(f"⚠️ message_classifier 失敗 (exit {result.returncode})")
+
+        # Broadcast status_reports to teammates via the RPi router.
+        # message_classifier runs in a subprocess with an unregistered socket,
+        # so its own send to the router is always dropped.  We re-send from the
+        # main registered sock here so every connected client receives the alert.
+        if payload.get("kind") == "status_report":
+            target = str(payload.get("target", "")).strip()
+            slang  = str(payload.get("lol_slang_line", "")).strip()
+            skill  = _infer_skill_from_slang(slang)
+            _broadcast_enemy_alert(target, skill)
 
 
 def voice_analysis_pipeline(audio_np: np.ndarray):

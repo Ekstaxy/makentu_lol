@@ -65,14 +65,15 @@ while True:
                     print(f"📨 [{sender_role}] 發送指令: {cmd_text[:80]}...")
                 last_print_time[print_key] = now
 
-            # Broadcast to ALL clients (snapshot the dict to avoid race conditions)
+            # Broadcast to all OTHER clients (skip sender to avoid echo/double-countdown).
             with clients_lock:
                 targets = dict(clients)
             for role, client_addr in targets.items():
-                try:
-                    sock.sendto(data, client_addr)
-                except Exception:
-                    pass
+                if client_addr != addr:
+                    try:
+                        sock.sendto(data, client_addr)
+                    except Exception:
+                        pass
             continue
 
         # 3. 解析語音封包標頭 (前 4 Bytes 是目標)
