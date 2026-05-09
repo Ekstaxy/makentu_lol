@@ -4,12 +4,15 @@ namespace Loupedeck.DemoPlugin
     using System.Collections.Generic;
     using System.Net.Sockets;
     using System.Text;
+    using System.Timers;
 
     public abstract class CountdownTimerCommandBase : PluginDynamicCommand
     {
         private const Int32 LocalIpcPort = 5006;
         private const Int32 AllyTimerStart = 6;
         private const Int32 AllyTimerEnd = 9;
+        private static readonly Timer IconRefreshTimer;
+        private static event Action RefreshTick;
         private static readonly String[] CharacterNamesByTimerId =
         {
             "蓋倫",
@@ -23,6 +26,14 @@ namespace Loupedeck.DemoPlugin
             "沃維克",
             "索娜",
         };
+
+        static CountdownTimerCommandBase()
+        {
+            IconRefreshTimer = new Timer(1000);
+            IconRefreshTimer.AutoReset = true;
+            IconRefreshTimer.Elapsed += (_, __) => RefreshTick?.Invoke();
+            IconRefreshTimer.Start();
+        }
 
         private readonly Int32 _timerId;
         private readonly Dictionary<Int32, String> _frameResources = new Dictionary<Int32, String>();
@@ -63,6 +74,7 @@ namespace Loupedeck.DemoPlugin
 
             CountdownState.StateChanged += this.OnCountdownStateChanged;
             AllyChannelState.StateChanged += this.OnAllyChannelStateChanged;
+            RefreshTick += this.OnRefreshTick;
             if (this._timerId == 1)
             {
                 SignalBlockState.StateChanged += this.OnSignalStateChanged;
@@ -98,13 +110,34 @@ namespace Loupedeck.DemoPlugin
                 allyChannelActive = AllyChannelState.IsTargeted(allySlot);
             }
 
-            if (this._characterImageBytes != null && this._characterImageBytes.Length > 0)
+            var characterBytes = this._characterImageBytes;
+            var topSkillBytes = this._topSkillImageBytes;
+            var bottomSkillBytes = this._bottomSkillImageBytes;
+            if (LiveInfoIconMapper.TryGetSlotResources(this._timerId, out var liveChampion, out var liveSpell1, out var liveSpell2))
+            {
+                if (liveChampion != null)
+                {
+                    characterBytes = liveChampion;
+                }
+
+                if (liveSpell1 != null)
+                {
+                    topSkillBytes = liveSpell1;
+                }
+
+                if (liveSpell2 != null)
+                {
+                    bottomSkillBytes = liveSpell2;
+                }
+            }
+
+            if (characterBytes != null && characterBytes.Length > 0)
             {
                 var composed = SkillCountdownImageComposer.TryBuild(
                     this._timerId,
-                    this._characterImageBytes,
-                    this._topSkillImageBytes,
-                    this._bottomSkillImageBytes,
+                    characterBytes,
+                    topSkillBytes,
+                    bottomSkillBytes,
                     fSec,
                     fRun,
                     tSec,
@@ -192,6 +225,12 @@ namespace Loupedeck.DemoPlugin
                 this.ActionImageChanged();
             }
         }
+
+        private void OnRefreshTick()
+        {
+            this.ActionImageChanged();
+        }
+
     }
 
     public class CountdownTimer1Command : CountdownTimerCommandBase
