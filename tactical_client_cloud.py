@@ -12,10 +12,15 @@ tactical_client_cloud.py — Central tactical voice client.
 
 Usage:
     python tactical_client_cloud.py
+
+Multi-client / 封包壓力：預設較大 PCM 區塊、麥克風送件非同步佇列、加寬 socket 緩衝，降低欠載型爆音。
+可選 tactical_config.json：「voice_chunk_frames」(預設 2048)、「voice_udp_queue_max」(預設 64)；
+或環境變數 TACTICAL_AUDIO_CHUNK_FRAMES、TACTICAL_UDP_QUEUE_MAX 覆寫。全員需使用相同 CHUNK 長度。
 """
 
 import json
 import os
+import queue
 import re
 import uuid
 import shutil
@@ -162,6 +167,12 @@ def load_config_or_exit() -> dict:
     pip_overlay_y = _config_opt_int(raw, "pip_overlay_y", 370)
     pip_overlay_idle_seconds = _config_opt_float(raw, "pip_overlay_idle_seconds", 5.0)
 
+    # Voice: larger blocks → fewer UDP packets/sec (helps RPi broadcast under many clients).
+    vcf = _config_opt_int(raw, "voice_chunk_frames", 2048)
+    vcf = max(256, min(4096, vcf))
+    vqm = _config_opt_int(raw, "voice_udp_queue_max", 64)
+    vqm = max(8, min(512, vqm))
+
     return {
         "server_ip":   str(ip).strip(),
         "server_port": udp_port,
@@ -182,6 +193,8 @@ def load_config_or_exit() -> dict:
         "pip_overlay_x":          pip_overlay_x,
         "pip_overlay_y":          pip_overlay_y,
         "pip_overlay_idle_seconds": pip_overlay_idle_seconds,
+        "voice_chunk_frames":     vcf,
+        "voice_udp_queue_max":    vqm,
     }
 
 
@@ -204,6 +217,24 @@ PIP_OVERLAY_HOST    = config["pip_overlay_host"]
 PIP_OVERLAY_PORT    = config["pip_overlay_udp_port"]
 PIP_OVERLAY_WHISPER = config["pip_overlay_whisper"]
 PIP_OVERLAY_AUTOSTART = config["pip_overlay_autostart"]
+
+CHANNELS = 1
+RATE = 16000
+CHUNK = max(256, min(4096, config["voice_chunk_frames"]))
+_env_frames = os.environ.get("TACTICAL_AUDIO_CHUNK_FRAMES", "").strip()
+if _env_frames:
+    try:
+        CHUNK = max(256, min(4096, int(_env_frames)))
+    except ValueError:
+        pass
+
+UDP_QUEUE_MAX = max(8, min(512, config["voice_udp_queue_max"]))
+_env_q = os.environ.get("TACTICAL_UDP_QUEUE_MAX", "").strip()
+if _env_q:
+    try:
+        UDP_QUEUE_MAX = max(8, min(512, int(_env_q)))
+    except ValueError:
+        pass
 
 
 def _udp_port_available(port: int) -> bool:
@@ -281,10 +312,6 @@ MY_ROLE  = _new_provisional_router_role()
 MY_HERO  = config["my_hero"]
 ALLIES   = config["allies"]
 ENEMIES  = config["enemies"]
-
-CHANNELS = 1
-RATE     = 16000
-CHUNK    = 1024   # ~64 ms per callback block
 
 # =====================================================================
 # ⚙️  Win-key PTT capture (tunable)
@@ -674,7 +701,11 @@ ptt_silence_start  = None  # wall-clock time or None
 # ⚙️  Audio output (plays incoming ally audio from RPi)
 # =====================================================================
 stream_out = sd.RawOutputStream(
-    samplerate=RATE, channels=CHANNELS, dtype="int16", blocksize=CHUNK
+    samplerate=RATE,
+    channels=CHANNELS,
+    dtype="int16",
+    blocksize=CHUNK,
+    latency="high",
 )
 stream_out.start()
 
@@ -683,6 +714,48 @@ stream_out.start()
 # =====================================================================
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.bind(("0.0.0.0", 0))
+try:
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+except OSError:
+    pass
+
+_udp_send_queue: queue.Queue = queue.Queue(maxsize=UDP_QUEUE_MAX)
+
+
+def _enqueue_udp_voice(tag: bytes, pcm16: bytes) -> None:
+    """Never block the realtime mic callback — drop oldest if saturated."""
+    try:
+        _udp_send_queue.put_nowait((tag, pcm16))
+    except queue.Full:
+        try:
+            _udp_send_queue.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            _udp_send_queue.put_nowait((tag, pcm16))
+        except queue.Full:
+            pass
+
+
+def _udp_sender_loop() -> None:
+    """Drain mic PCM off the realtime thread so sendto/Wi‑Fi stack jitter cannot xrun capture."""
+    while is_running:
+        try:
+            tag, pcm16 = _udp_send_queue.get(timeout=0.25)
+        except queue.Empty:
+            continue
+        try:
+            sock.sendto(tag + pcm16, (RPI_IP, UDP_PORT))
+        except Exception:
+            pass
+
+
+threading.Thread(target=_udp_sender_loop, daemon=True).start()
+print(
+    f"🎚 語音區塊 {CHUNK} frames (~{1000.0 * CHUNK / RATE:.0f} ms)，"
+    f"UDP 佇列上限 {UDP_QUEUE_MAX}（多人連線時降低欠載爆音）"
+)
 
 
 def register_with_router():
@@ -821,11 +894,8 @@ def _mic_callback(indata, frames, callback_time, status):
 
     # 1. UDP relay — convert to int16 PCM and tag with routing header
     pcm16 = (np.clip(mono, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
-    tag   = current_tag   # read atomic bytes reference
-    try:
-        sock.sendto(tag + pcm16, (RPI_IP, UDP_PORT))
-    except Exception:
-        pass
+    tag = current_tag
+    _enqueue_udp_voice(tag, pcm16)
 
     # 2. PTT capture — only after LoL live roster sync (same gate as former VAD)
     finalize_buf = None
@@ -955,7 +1025,11 @@ def receive_and_play():
                 continue
 
             # Normal audio: first 4 bytes = sender role tag, rest = int16 PCM
-            stream_out.write(data[4:])
+            pcm = data[4:]
+            need = CHUNK * CHANNELS * 2
+            if len(pcm) != need:
+                continue
+            stream_out.write(pcm)
         except Exception:
             pass
 
@@ -1653,6 +1727,7 @@ mic_stream = sd.InputStream(
     channels=CHANNELS,
     dtype="float32",
     blocksize=CHUNK,
+    latency="high",
     callback=_mic_callback,
 )
 mic_stream.start()
