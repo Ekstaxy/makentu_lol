@@ -351,7 +351,7 @@ class ObsScreen(tk.Frame):
         config = {
             "server_ip": server_ip,
             "server_port": server_port,
-            "my_role": "MID",
+            "my_role": "PEND",
             "my_hero": "安妮",
             "allies": ["JG", "TOP", "BOT", "SUP"],
             "enemies": ["蓋倫", "好運姐", "阿姆姆", "雷歐娜", "艾希"],

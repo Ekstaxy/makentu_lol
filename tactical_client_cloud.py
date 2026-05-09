@@ -17,6 +17,7 @@ Usage:
 import json
 import os
 import re
+import uuid
 import shutil
 import socket
 import ssl
@@ -118,7 +119,12 @@ UDP_PORT          = config["server_port"]
 LOCAL_IPC_PORT    = 5006   # Loupedeck plugin → this client
 LOCAL_PLUGIN_PORT = 5005   # this client → Loupedeck plugin
 
-MY_ROLE  = config["my_role"]
+def _new_provisional_router_role() -> str:
+    """Unique id for HELLO before / without lane sync (Z + 7 hex)."""
+    return "Z" + uuid.uuid4().hex[:7].upper()
+
+
+MY_ROLE  = _new_provisional_router_role()
 MY_HERO  = config["my_hero"]
 ALLIES   = config["allies"]
 ENEMIES  = config["enemies"]
@@ -274,6 +280,60 @@ def copy_assets(result: dict):
             print(f"[warn] spell image not found: {SRC_SPELL_DIR / (s + '.png/.PNG')}")
 
 
+def _riot_position_to_lane_role(pos) -> str | None:
+    """Map Live Client / Riot position strings to router lane keys (MID, JG, TOP, BOT, SUP)."""
+    if pos is None:
+        return None
+    p = str(pos).strip().upper().replace(" ", "").replace("_", "")
+    if not p or p in ("NONE", "INVALID"):
+        return None
+    direct = {
+        "TOP": "TOP",
+        "JUNGLE": "JG",
+        "JUN": "JG",
+        "JG": "JG",
+        "MIDDLE": "MID",
+        "MID": "MID",
+        "BOTTOM": "BOT",
+        "BOT": "BOT",
+        "UTILITY": "SUP",
+        "SUPPORT": "SUP",
+        "DUO": "SUP",
+        "CARRY": "BOT",
+    }
+    if p in direct:
+        return direct[p]
+    if "JUNGLE" in p or "JGL" == p:
+        return "JG"
+    if "MIDDLE" in p or p == "MIDLANE":
+        return "MID"
+    if "BOTTOM" in p or p == "ADC":
+        return "BOT"
+    if "UTILITY" in p or "SUPPORT" in p:
+        return "SUP"
+    return None
+
+
+def extract_my_lane_role_from_allgamedata(data: dict) -> str | None:
+    """Read teamPosition / individualPosition from allPlayers for the active summoner."""
+    all_players = data.get("allPlayers") or []
+    active = data.get("activePlayer") or {}
+    my_name = active.get("summonerName")
+    if not my_name or not all_players:
+        return None
+    me = next((p for p in all_players if p.get("summonerName") == my_name), None)
+    if not me:
+        return None
+    for key in ("teamPosition", "individualPosition", "position", "lane"):
+        raw = me.get(key)
+        if raw is None:
+            continue
+        lane = _riot_position_to_lane_role(raw)
+        if lane:
+            return lane
+    return None
+
+
 def mirror_liveinfo_for_plugin():
     local = os.environ.get("LOCALAPPDATA")
     if not local:
@@ -294,7 +354,8 @@ def mirror_liveinfo_for_plugin():
         print(f"[warn] mirror to LiveInfo failed: {e}")
 
 
-def update_tactical_config(result: dict):
+def update_tactical_config(result: dict, all_gamedata: dict | None = None):
+    """Persist roster + lane from Live Client; lane updates my_role so router can switch off provisional Z-id."""
     try:
         config_doc = {}
         if CONFIG_PATH.exists():
@@ -315,12 +376,19 @@ def update_tactical_config(result: dict):
         if enemies:
             config_doc["enemies"] = enemies[:5]
 
+        lane = extract_my_lane_role_from_allgamedata(all_gamedata) if all_gamedata else None
+        if lane:
+            config_doc["my_role"] = lane
+        else:
+            # Avoid restoring stale MID/JG from disk when API has no position yet (e.g. ARAM load).
+            config_doc["my_role"] = MY_ROLE
+
         CONFIG_PATH.write_text(
             json.dumps(config_doc, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         print(
-            f"updated tactical_config.json → my_hero={config_doc.get('my_hero')!r}, "
-            f"enemies={config_doc.get('enemies')}"
+            f"updated tactical_config.json → my_role={config_doc.get('my_role')!r}, "
+            f"my_hero={config_doc.get('my_hero')!r}, enemies={config_doc.get('enemies')}"
         )
     except Exception as e:
         print(f"[warn] could not update tactical_config.json: {e}")
@@ -411,7 +479,7 @@ def wait_for_live_client_and_sync() -> bool:
             )
             copy_assets(result)
             mirror_liveinfo_for_plugin()
-            update_tactical_config(result)
+            update_tactical_config(result, data)
             print(f"wrote {OUT_JSON}")
             return True
         time.sleep(LOL_LIVEINFO_POLL_INTERVAL_SEC)
@@ -1012,7 +1080,7 @@ def _send_local_signal(signal_text: str):
 # 🏁  Main
 # =====================================================================
 print(f"\n🌐 連接至 RPi 路由器 ({RPI_IP}:{UDP_PORT})")
-print(f"🎮 我: {MY_ROLE} ({MY_HERO})")
+print(f"🎮 我 (暫時路由 ID): {MY_ROLE} — 英雄: {MY_HERO}（對局同步後依 API 註冊線路）")
 print(f"🤝 隊友: {', '.join(ALLIES)}")
 print(f"⚔️  敵方: {', '.join(ENEMIES)}")
 

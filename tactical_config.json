@@ -1,8 +1,8 @@
 {
-  "server_ip": "10.10.31.138",
+  "server_ip": "10.10.32.27",
   "server_port": 5005,
   "my_role": "MID",
-  "my_hero": "索娜",
+  "my_hero": "安妮",
   "allies": [
     "JG",
     "TOP",
@@ -10,11 +10,11 @@
     "SUP"
   ],
   "enemies": [
-    "麗珊卓",
-    "魔甘娜",
-    "墨菲特",
-    "卡爾瑟斯",
-    "古拉格斯"
+    "蓋倫",
+    "好運姐",
+    "阿姆姆",
+    "雷歐娜",
+    "艾希"
   ],
   "obs_host": "localhost",
   "obs_port": 4455,
