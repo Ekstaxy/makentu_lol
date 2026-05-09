@@ -16,6 +16,7 @@ Usage:
 
 import json
 import os
+import queue
 import re
 import uuid
 import shutil
@@ -936,8 +937,21 @@ def ipc_listener():
 
 
 # =====================================================================
-# 📡  Audio receiver — plays incoming ally voice from RPi
+# 📡  Audio receiver — collects incoming ally voice from RPi
+#
+#  Each sender's audio is queued separately so the mixer can blend
+#  them into a single output frame.  Writing all streams directly to
+#  stream_out caused a machine-gun artifact: with N≥3 people the loop
+#  wrote (N-1)× the audio the playback ring-buffer could consume,
+#  overflowing it and producing rapid clicking / glitches.
 # =====================================================================
+
+# Per-sender queues: role_tag (str) → queue.Queue of bytes (int16 PCM, CHUNK samples)
+_audio_queues: dict[str, queue.Queue] = {}
+_audio_queues_lock = threading.Lock()
+_AUDIO_QUEUE_MAX = 8   # cap per sender (~512 ms); older frames are dropped on overflow
+
+
 def receive_and_play():
     print("📡 監聽戰術頻道中...")
     while is_running:
@@ -954,8 +968,61 @@ def receive_and_play():
                 handle_incoming_command(data)
                 continue
 
-            # Normal audio: first 4 bytes = sender role tag, rest = int16 PCM
-            stream_out.write(data[4:])
+            # Normal audio: first 4 bytes = sender role tag, rest = int16 PCM.
+            # Push into the per-sender queue for the mixer thread to consume.
+            sender_tag = preview
+            pcm_bytes  = data[4:]
+            with _audio_queues_lock:
+                if sender_tag not in _audio_queues:
+                    _audio_queues[sender_tag] = queue.Queue(maxsize=_AUDIO_QUEUE_MAX)
+                q = _audio_queues[sender_tag]
+            try:
+                q.put_nowait(pcm_bytes)
+            except queue.Full:
+                # Drop the oldest frame to make room so latency stays bounded.
+                try:
+                    q.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    q.put_nowait(pcm_bytes)
+                except queue.Full:
+                    pass
+        except Exception:
+            pass
+
+
+def audio_mixer_loop():
+    """Mix one CHUNK from every active sender and write the blended frame to stream_out.
+
+    stream_out.write() blocks until PortAudio has room for the frame, so this
+    loop is naturally clocked at RATE Hz — it cannot write faster than playback
+    regardless of how many senders are active.
+    """
+    silence = bytes(CHUNK * 2)   # int16 → 2 bytes per sample
+    while is_running:
+        with _audio_queues_lock:
+            queues = list(_audio_queues.values())
+
+        mixed: np.ndarray | None = None
+        for q in queues:
+            try:
+                pcm_bytes = q.get_nowait()
+            except queue.Empty:
+                continue
+            chunk_arr = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.int32)
+            if mixed is None:
+                mixed = chunk_arr
+            elif len(chunk_arr) == len(mixed):
+                mixed = mixed + chunk_arr
+
+        if mixed is not None:
+            out = np.clip(mixed, -32768, 32767).astype(np.int16).tobytes()
+        else:
+            out = silence
+
+        try:
+            stream_out.write(out)
         except Exception:
             pass
 
@@ -1646,6 +1713,7 @@ def _preload():
 # Voice to RPi + IPC + RX first; LoL live fetch blocks analysis until in-game.
 threading.Thread(target=ipc_listener, daemon=True).start()
 threading.Thread(target=receive_and_play, daemon=True).start()
+threading.Thread(target=audio_mixer_loop, daemon=True).start()
 threading.Thread(target=win_ptt_listener, daemon=True).start()
 
 mic_stream = sd.InputStream(
