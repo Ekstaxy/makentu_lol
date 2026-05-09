@@ -2,12 +2,13 @@
 tactical_client_cloud.py — Central tactical voice client.
 
 5v5 LOL voice system:
-  - Mic is ALWAYS ON — no PTT button needed to start talking
+  - Mic is always captured — UDP voice to RPi is independent of analysis
   - Audio is tagged ALL by default; PTT_ALLY*_TOGGLE buttons change who receives it
-  - VAD (Voice Activity Detection) segments speech automatically — no manual start/stop
-  - Whisper + OpenAI run on every detected speech segment
-  - CMD:ENEMY_ALERT is always broadcast to ALL via RPi
-  - START<n>F/T signals trigger countdown on the local Loupedeck console
+  - Tap the Windows key (press then release) to record up to 3s for Whisper / AI
+    (ends early on trailing silence); communication stays always-on
+  - Whisper + OpenAI run on each completed PTT clip
+  - After AI JSON: runs message_classifier.py (same as test_voice_all_whisper.py) —
+    RPi UDP, local countdown UDP to Loupedeck, in-game chat via keyboard
 
 Usage:
     python tactical_client_cloud.py
@@ -15,11 +16,16 @@ Usage:
 
 import json
 import os
-import queue
 import re
+import shutil
 import socket
+import ssl
+import subprocess
+import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 import numpy as np
@@ -36,43 +42,98 @@ BASE_DIR    = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "tactical_config.json"
 
 
-def load_config():
-    if CONFIG_PATH.exists():
+def _die(msg: str) -> None:
+    print(msg, file=sys.stderr)
+    sys.exit(1)
+
+
+def load_config_or_exit() -> dict:
+    """Read only tactical_config.json — no in-code game defaults (avoids masking user config)."""
+    if not CONFIG_PATH.is_file():
+        _die(f"[錯誤] 找不到 {CONFIG_PATH}，請先建立或編輯 tactical_config.json 後再啟動。")
+
+    try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
+            raw = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        _die(f"[錯誤] 無法讀取 tactical_config.json：{e}")
+
+    if not isinstance(raw, dict):
+        _die("[錯誤] tactical_config.json 頂層必須是 JSON 物件。")
+
+    ip = raw.get("server_ip")
+    if ip is None or not str(ip).strip():
+        _die('[錯誤] tactical_config.json 缺少或無效的 "server_ip"。')
+
+    port_raw = raw.get("server_port")
+    if port_raw is None:
+        _die('[錯誤] tactical_config.json 缺少 "server_port"。')
+    try:
+        udp_port = int(port_raw)
+    except (TypeError, ValueError):
+        _die('[錯誤] tactical_config.json 的 "server_port" 必須為整數。')
+
+    role = raw.get("my_role")
+    if role is None or not str(role).strip():
+        _die('[錯誤] tactical_config.json 缺少或空的 "my_role"。')
+
+    hero = raw.get("my_hero")
+    if hero is None or not str(hero).strip():
+        _die('[錯誤] tactical_config.json 缺少或空的 "my_hero"。')
+
+    allies = raw.get("allies")
+    if not isinstance(allies, list) or len(allies) < 4:
+        _die('[錯誤] tactical_config.json 的 "allies" 必須為長度至少 4 的陣列。')
+    allies_out = []
+    for i, a in enumerate(allies[:4]):
+        s = str(a).strip() if a is not None else ""
+        if not s:
+            _die(f'[錯誤] tactical_config.json allies[{i}] 不可為空。')
+        allies_out.append(s)
+
+    enemies = raw.get("enemies")
+    if not isinstance(enemies, list) or len(enemies) < 5:
+        _die('[錯誤] tactical_config.json 的 "enemies" 必須為長度至少 5 的陣列。')
+    enemies_out = []
+    for i, e in enumerate(enemies[:5]):
+        s = str(e).strip() if e is not None else ""
+        if not s:
+            _die(f'[錯誤] tactical_config.json enemies[{i}] 不可為空。')
+        enemies_out.append(s)
+
     return {
-        "server_ip":   "172.20.10.2",
-        "server_port": 5005,
-        "my_role":     "MID",
-        "my_hero":     "蓋倫",
-        "allies":      ["JG", "TOP", "BOT", "SUP"],
-        "enemies":     ["安妮", "好運姐", "阿姆姆", "雷歐娜", "墨菲特"],
+        "server_ip":   str(ip).strip(),
+        "server_port": udp_port,
+        "my_role":     str(role).strip(),
+        "my_hero":     str(hero).strip(),
+        "allies":      allies_out,
+        "enemies":     enemies_out,
     }
 
 
-config = load_config()
+config = load_config_or_exit()
 
-RPI_IP            = config.get("server_ip",   "172.20.10.2")
-UDP_PORT          = config.get("server_port",  5005)
+RPI_IP            = config["server_ip"]
+UDP_PORT          = config["server_port"]
 LOCAL_IPC_PORT    = 5006   # Loupedeck plugin → this client
 LOCAL_PLUGIN_PORT = 5005   # this client → Loupedeck plugin
 
-MY_ROLE  = config.get("my_role",  "MID")
-MY_HERO  = config.get("my_hero",  "")
-ALLIES   = config.get("allies",   [])[:4]
-ENEMIES  = config.get("enemies",  [])[:5]
+MY_ROLE  = config["my_role"]
+MY_HERO  = config["my_hero"]
+ALLIES   = config["allies"]
+ENEMIES  = config["enemies"]
 
 CHANNELS = 1
 RATE     = 16000
 CHUNK    = 1024   # ~64 ms per callback block
 
 # =====================================================================
-# ⚙️  VAD parameters (tunable)
+# ⚙️  Win-key PTT capture (tunable)
 # =====================================================================
-VAD_SPEECH_RMS    = 0.01   # float32 RMS threshold — above this = speaking
-VAD_SILENCE_TIMEOUT = 1.5  # seconds of silence after speech → flush to Whisper
-VAD_MIN_DURATION  = 0.5    # seconds — discard shorter segments (noise bursts)
-VAD_MAX_DURATION  = 10.0   # seconds — force-flush even if still speaking
+PTT_SPEECH_RMS         = 0.01   # float32 RMS threshold — above this = speaking
+PTT_SILENCE_TIMEOUT    = 0.5    # seconds of silence after speech → end clip early
+PTT_MIN_DURATION       = 0.5    # seconds — discard shorter clips (noise bursts)
+PTT_MAX_DURATION_SEC   = 3.0    # hard cap per tap
 
 # =====================================================================
 # ⚙️  OpenAI client — initialised once at startup
@@ -101,10 +162,270 @@ HOTKEYS = {
 }
 
 # =====================================================================
+# ⚙️  message_classifier pipeline (same flow as test_voice_all_whisper.py)
+# =====================================================================
+PIPELINE_JSON_PATH = BASE_DIR / "pipeline_payload.json"
+CLASSIFIER_SCRIPT_PATH = BASE_DIR / "message_classifier.py"
+CLASSIFIER_TIMEOUT_SECONDS = 8
+IMAGES_ROOT = BASE_DIR / "DemoPlugin" / "DemoPlugin" / "info"
+
+
+def _list_png_stems(folder: Path):
+    if not folder.exists():
+        return []
+    stems = []
+    for p in folder.iterdir():
+        if p.is_file() and p.suffix.lower() == ".png":
+            stems.append(p.stem.strip())
+    return sorted(set(s for s in stems if s))
+
+
+CHARACTER_NAME_LIST = _list_png_stems(IMAGES_ROOT / "champions")
+SKILL_NAME_LIST = _list_png_stems(IMAGES_ROOT / "spell")
+CHARACTER_NAMES_PROMPT = "、".join(CHARACTER_NAME_LIST) if CHARACTER_NAME_LIST else "（未偵測到角色圖檔）"
+SKILL_NAMES_PROMPT = "、".join(SKILL_NAME_LIST) if SKILL_NAME_LIST else "（未偵測到技能圖檔）"
+
+# =====================================================================
+# ⚙️  LoL Live Client Data API (port 2999) — same layout as lol_live_info.py
+# =====================================================================
+LIVE_CLIENT_BASE = "https://127.0.0.1:2999/liveclientdata"
+LOL_LIVEINFO_POLL_INTERVAL_SEC = 5.0
+
+OUT_INFO_DIR = IMAGES_ROOT / "lol_character" / "info"
+OUT_JSON = OUT_INFO_DIR / "lol_live_info.json"
+SRC_CHAMPION_DIR = IMAGES_ROOT / "characters"
+SRC_SPELL_DIR = IMAGES_ROOT / "skills"
+OUT_CHAMPION_DIR = OUT_INFO_DIR / "champion"
+OUT_SPELL_DIR = OUT_INFO_DIR / "spell"
+
+_INSECURE_SSL = ssl.create_default_context()
+_INSECURE_SSL.check_hostname = False
+_INSECURE_SSL.verify_mode = ssl.CERT_NONE
+
+
+def _live_client_json_get(url: str, timeout: float = 2.0):
+    try:
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=timeout, context=_INSECURE_SSL) as resp:
+            if resp.status != 200:
+                return None
+            body = resp.read()
+        return json.loads(body.decode("utf-8"))
+    except (
+        urllib.error.URLError,
+        urllib.error.HTTPError,
+        TimeoutError,
+        OSError,
+        json.JSONDecodeError,
+        ValueError,
+    ):
+        return None
+
+
+def get_gamestats():
+    return _live_client_json_get(f"{LIVE_CLIENT_BASE}/gamestats", timeout=2.0)
+
+
+def get_allgamedata():
+    return _live_client_json_get(f"{LIVE_CLIENT_BASE}/allgamedata", timeout=2.0)
+
+
+def clear_info_dir():
+    OUT_INFO_DIR.mkdir(parents=True, exist_ok=True)
+    for item in OUT_INFO_DIR.iterdir():
+        if item.is_file():
+            item.unlink()
+        elif item.is_dir():
+            shutil.rmtree(item)
+
+
+def copy_assets(result: dict):
+    OUT_CHAMPION_DIR.mkdir(parents=True, exist_ok=True)
+    OUT_SPELL_DIR.mkdir(parents=True, exist_ok=True)
+
+    champions = set()
+    spells = set()
+    for side in ("myTeam", "theirTeam"):
+        for p in result.get(side, []):
+            champions.add(p.get("champion", ""))
+            spells.add(p.get("spell1", ""))
+            spells.add(p.get("spell2", ""))
+
+    for c in champions:
+        if not c:
+            continue
+        src = SRC_CHAMPION_DIR / f"{c}.png"
+        dst = OUT_CHAMPION_DIR / f"{c}.png"
+        if src.exists():
+            shutil.copy(src, dst)
+        else:
+            print(f"[warn] champion image not found: {src}")
+
+    for s in spells:
+        if not s:
+            continue
+        src_png = SRC_SPELL_DIR / f"{s}.png"
+        src_PNG = SRC_SPELL_DIR / f"{s}.PNG"
+        src = src_png if src_png.exists() else src_PNG
+        dst = OUT_SPELL_DIR / f"{s}.png"
+        if src.exists():
+            shutil.copy(src, dst)
+        else:
+            print(f"[warn] spell image not found: {SRC_SPELL_DIR / (s + '.png/.PNG')}")
+
+
+def mirror_liveinfo_for_plugin():
+    local = os.environ.get("LOCALAPPDATA")
+    if not local:
+        print("[warn] LOCALAPPDATA not set; skipping mirror to Logi LiveInfo folder")
+        return
+    dest_root = Path(local) / "Logi" / "LogiPluginService" / "LiveInfo"
+    try:
+        dest_root.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(OUT_JSON, dest_root / "lol_live_info.json")
+        dst_champ = dest_root / "champion"
+        dst_spell = dest_root / "spell"
+        if OUT_CHAMPION_DIR.exists():
+            shutil.copytree(OUT_CHAMPION_DIR, dst_champ, dirs_exist_ok=True)
+        if OUT_SPELL_DIR.exists():
+            shutil.copytree(OUT_SPELL_DIR, dst_spell, dirs_exist_ok=True)
+        print(f"mirrored live info → {dest_root}")
+    except Exception as e:
+        print(f"[warn] mirror to LiveInfo failed: {e}")
+
+
+def update_tactical_config(result: dict):
+    try:
+        config_doc = {}
+        if CONFIG_PATH.exists():
+            config_doc = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+
+        for p in result.get("myTeam", []):
+            if p.get("isMe"):
+                hero = (p.get("champion") or "").strip()
+                if hero:
+                    config_doc["my_hero"] = hero
+                break
+
+        enemies = [
+            (p.get("champion") or "").strip()
+            for p in result.get("theirTeam", [])
+            if (p.get("champion") or "").strip()
+        ]
+        if enemies:
+            config_doc["enemies"] = enemies[:5]
+
+        CONFIG_PATH.write_text(
+            json.dumps(config_doc, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        print(
+            f"updated tactical_config.json → my_hero={config_doc.get('my_hero')!r}, "
+            f"enemies={config_doc.get('enemies')}"
+        )
+    except Exception as e:
+        print(f"[warn] could not update tactical_config.json: {e}")
+
+
+def build_liveinfo_result_from_allgamedata(data: dict):
+    all_players = data.get("allPlayers", [])
+    active_player = data.get("activePlayer", {})
+    my_name = active_player.get("summonerName")
+    if not all_players or not my_name:
+        return None
+    my_team_id = next(
+        (p.get("team") for p in all_players if p.get("summonerName") == my_name),
+        None,
+    )
+    if not my_team_id:
+        return None
+    result = {"status": "In Game", "myTeam": [], "theirTeam": []}
+    for p in all_players:
+        p_info = {
+            "isMe": p.get("summonerName") == my_name,
+            "champion": p.get("championName"),
+            "spell1": p.get("summonerSpells", {})
+            .get("summonerSpellOne", {})
+            .get("displayName"),
+            "spell2": p.get("summonerSpells", {})
+            .get("summonerSpellTwo", {})
+            .get("displayName"),
+        }
+        side = "myTeam" if p.get("team") == my_team_id else "theirTeam"
+        result[side].append(p_info)
+    return result
+
+
+def reload_runtime_config_from_disk():
+    """Reload MY_ROLE / MY_HERO / ENEMIES from tactical_config.json; re-HELLO router."""
+    global MY_HERO, ENEMIES, MY_ROLE
+    if not CONFIG_PATH.is_file():
+        return
+    try:
+        raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    r = raw.get("my_role")
+    if r is not None and str(r).strip():
+        MY_ROLE = str(r).strip()
+    h = raw.get("my_hero")
+    if h is not None and str(h).strip():
+        MY_HERO = str(h).strip()
+    en = raw.get("enemies")
+    if isinstance(en, list) and len(en) >= 5:
+        enemies_out = []
+        ok = True
+        for i, e in enumerate(en[:5]):
+            s = str(e).strip() if e is not None else ""
+            if not s:
+                ok = False
+                break
+            enemies_out.append(s)
+        if ok:
+            ENEMIES = enemies_out
+    register_with_router()
+
+
+def wait_for_live_client_and_sync() -> bool:
+    """Block until 2999 API returns a full roster; writes JSON, assets, config."""
+    clear_info_dir()
+    poll_only = os.environ.get("LOL_LIVEINFO_POLL_ONLY", "").strip().lower() in ("1", "true", "yes")
+    print("=== 等待 LoL Live Client（對局載入後 API 才可用；每 {:.0f}s 重試）===".format(
+        LOL_LIVEINFO_POLL_INTERVAL_SEC
+    ))
+    if poll_only:
+        print("(LOL_LIVEINFO_POLL_ONLY：略過 gamestats，僅輪詢 allgamedata)")
+    while is_running:
+        if not poll_only:
+            if get_gamestats() is None:
+                time.sleep(LOL_LIVEINFO_POLL_INTERVAL_SEC)
+                continue
+        data = get_allgamedata()
+        if data is None:
+            time.sleep(LOL_LIVEINFO_POLL_INTERVAL_SEC)
+            continue
+        result = build_liveinfo_result_from_allgamedata(data)
+        if result:
+            OUT_JSON.parent.mkdir(parents=True, exist_ok=True)
+            OUT_JSON.write_text(
+                json.dumps(result, ensure_ascii=False, indent=4), encoding="utf-8"
+            )
+            copy_assets(result)
+            mirror_liveinfo_for_plugin()
+            update_tactical_config(result)
+            print(f"wrote {OUT_JSON}")
+            return True
+        time.sleep(LOL_LIVEINFO_POLL_INTERVAL_SEC)
+    return False
+
+
+# =====================================================================
 # ⚙️  Global state
 # =====================================================================
 is_running = True
 state_lock = threading.Lock()
+
+# Set after LoL live fetch completes — mic still sends UDP before this.
+liveinfo_ready = threading.Event()
 
 # Routing tag — 4-byte UDP header.  ALL by default; changed by ally toggles.
 # Written only from ipc_listener thread; read from mic callback (lock-free OK
@@ -116,8 +437,11 @@ enabled_ally_slots        = set(range(1, len(ALLIES) + 1))
 pending_ally_slots        = set(enabled_ally_slots)
 selection_window_deadline = 0.0
 
-# Queue: mic callback → VAD thread
-vad_queue: queue.Queue = queue.Queue(maxsize=2048)
+# Win-key PTT — armed after Win release; mic callback fills ptt_chunks until flush
+ptt_armed          = False
+ptt_chunks: list   = []
+ptt_in_speech      = False
+ptt_silence_start  = None  # wall-clock time or None
 
 # =====================================================================
 # ⚙️  Audio output (plays incoming ally audio from RPi)
@@ -132,8 +456,18 @@ stream_out.start()
 # =====================================================================
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.bind(("0.0.0.0", 0))
-sock.sendto(f"HELLO:{MY_ROLE}".encode(), (RPI_IP, UDP_PORT))
-print(f"已向伺服器註冊身分: [{MY_ROLE}] → {RPI_IP}:{UDP_PORT}")
+
+
+def register_with_router():
+    """Send HELLO so RPi maps this UDP endpoint to MY_ROLE (required for whisper / isolated routing)."""
+    try:
+        sock.sendto(f"HELLO:{MY_ROLE}".encode(), (RPI_IP, UDP_PORT))
+        print(f"已向伺服器註冊身分: [{MY_ROLE}] → {RPI_IP}:{UDP_PORT}")
+    except OSError as e:
+        print(f"[warn] HELLO 傳送失敗: {e}")
+
+
+register_with_router()
 
 # =====================================================================
 # 🔧  Send config to Loupedeck plugin
@@ -192,15 +526,67 @@ def _write_pid():
 _kill_previous_instance()
 _write_pid()
 
+def _clear_ptt_session_locked():
+    global ptt_armed, ptt_in_speech, ptt_silence_start
+    ptt_armed = False
+    ptt_chunks.clear()
+    ptt_in_speech = False
+    ptt_silence_start = None
+
+
+def _flush_ptt_session(buf: list):
+    """Concatenate collected chunks and dispatch to voice_analysis_pipeline."""
+    if not buf:
+        return
+    audio_np = np.concatenate(buf).flatten()
+    duration = len(audio_np) / RATE
+    if duration < PTT_MIN_DURATION:
+        print(f"[PTT] 錄音太短 ({duration:.1f}s)，已忽略")
+        return
+    print(f"[PTT] 語音 {duration:.1f}s → Whisper")
+    threading.Thread(
+        target=voice_analysis_pipeline,
+        args=(audio_np,),
+        daemon=True,
+    ).start()
+
+
+def win_ptt_listener():
+    """Wait for Windows key press+release, then arm one PTT capture (if liveinfo ready)."""
+    global ptt_armed, ptt_in_speech, ptt_silence_start
+    import keyboard as kb
+
+    while is_running:
+        try:
+            kb.wait("windows")
+        except Exception:
+            if not is_running:
+                break
+            time.sleep(0.2)
+            continue
+        while is_running and kb.is_pressed("windows"):
+            time.sleep(0.02)
+        time.sleep(0.04)
+        with state_lock:
+            if not liveinfo_ready.is_set() or ptt_armed:
+                continue
+            ptt_armed = True
+            ptt_chunks.clear()
+            ptt_in_speech = False
+            ptt_silence_start = None
+        print("[PTT] 錄音開始（最多 3 秒，靜音自動結束）")
+
+
 # =====================================================================
 # 🎙️  Always-on mic callback
 #
 #  Two jobs per chunk:
 #    1. UDP relay  → RPi with current_tag (ALL or specific role)
-#    2. VAD feed   → push into vad_queue for the VAD thread
+#    2. PTT buffer → when armed, accumulate until max duration or trailing silence
 # =====================================================================
 def _mic_callback(indata, frames, callback_time, status):
     """sounddevice calls this for every CHUNK frames, always."""
+    global ptt_in_speech, ptt_silence_start
     if status:
         print(f"⚠️ 麥克風: {status}")
 
@@ -214,90 +600,32 @@ def _mic_callback(indata, frames, callback_time, status):
     except Exception:
         pass
 
-    # 2. VAD feed — push float32 chunk (copy so callback returns fast)
-    try:
-        vad_queue.put_nowait(mono.copy())
-    except queue.Full:
-        pass   # drop oldest-style: VAD thread is behind, skip this chunk
+    # 2. PTT capture — only after LoL live roster sync (same gate as former VAD)
+    finalize_buf = None
+    with state_lock:
+        if not ptt_armed or not liveinfo_ready.is_set():
+            return
+        ptt_chunks.append(mono.copy())
+        rms = float(np.sqrt(np.mean(mono ** 2)))
+        dur = len(ptt_chunks) * CHUNK / RATE
 
+        if rms > PTT_SPEECH_RMS:
+            ptt_in_speech = True
+            ptt_silence_start = None
+        elif ptt_in_speech:
+            if ptt_silence_start is None:
+                ptt_silence_start = time.time()
+            elif time.time() - ptt_silence_start >= PTT_SILENCE_TIMEOUT:
+                finalize_buf = ptt_chunks.copy()
 
-# =====================================================================
-# 🔊  VAD thread — segments speech and dispatches to Whisper pipeline
-# =====================================================================
-def vad_loop():
-    """
-    Energy-based Voice Activity Detection.
+        if finalize_buf is None and dur >= PTT_MAX_DURATION_SEC:
+            finalize_buf = ptt_chunks.copy()
 
-    State machine:
-      SILENCE  — waiting for speech onset
-      SPEECH   — accumulating speech frames
-      TRAILING — speech ended, counting silence before flush
-    """
-    speech_buf   = []
-    in_speech    = False
-    silence_start = None
+        if finalize_buf is not None:
+            _clear_ptt_session_locked()
 
-    while is_running:
-        try:
-            chunk = vad_queue.get(timeout=0.5)
-        except queue.Empty:
-            if in_speech and speech_buf:
-                dur = len(speech_buf) * CHUNK / RATE
-                # Force-flush on max duration
-                if dur >= VAD_MAX_DURATION:
-                    _flush_speech(speech_buf)
-                    speech_buf    = []
-                    in_speech     = False
-                    silence_start = None
-                # Also flush if silence timeout has elapsed since last sound
-                elif silence_start is not None and (time.time() - silence_start) >= VAD_SILENCE_TIMEOUT:
-                    _flush_speech(speech_buf)
-                    speech_buf    = []
-                    in_speech     = False
-                    silence_start = None
-            continue
-
-        rms = float(np.sqrt(np.mean(chunk ** 2)))
-
-        if rms > VAD_SPEECH_RMS:
-            # Active speech
-            in_speech     = True
-            silence_start = None
-            speech_buf.append(chunk)
-
-            # Force-flush if duration exceeded
-            dur = len(speech_buf) * CHUNK / RATE
-            if dur >= VAD_MAX_DURATION:
-                _flush_speech(speech_buf)
-                speech_buf    = []
-                in_speech     = False
-                silence_start = None
-
-        elif in_speech:
-            # Trailing silence after speech
-            speech_buf.append(chunk)
-            if silence_start is None:
-                silence_start = time.time()
-            elif time.time() - silence_start >= VAD_SILENCE_TIMEOUT:
-                _flush_speech(speech_buf)
-                speech_buf    = []
-                in_speech     = False
-                silence_start = None
-        # else: pure silence before any speech — discard chunk
-
-
-def _flush_speech(buf: list):
-    """Concatenate collected chunks and dispatch to voice_analysis_pipeline."""
-    audio_np = np.concatenate(buf).flatten()
-    duration = len(audio_np) / RATE
-    if duration < VAD_MIN_DURATION:
-        return
-    print(f"[VAD] 偵測到語音 {duration:.1f}s → Whisper")
-    threading.Thread(
-        target=voice_analysis_pipeline,
-        args=(audio_np,),
-        daemon=True,
-    ).start()
+    if finalize_buf is not None:
+        _flush_ptt_session(finalize_buf)
 
 
 # =====================================================================
@@ -447,12 +775,153 @@ def _ensure_whisper():
     return _whisper_model
 
 
-def voice_analysis_pipeline(audio_np: np.ndarray):
-    """float32 audio → Whisper → OpenAI → route.
+def _extract_json_blob(text: str):
+    """Extract first JSON blob (object or array) from model output — same as test_voice_all_whisper."""
+    text = text.strip()
+    fence = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text, re.IGNORECASE)
+    if fence:
+        text = fence.group(1).strip()
 
-    audio_np: shape (N,), float32, range [-1, 1] — same contract as
-    test_voice_all_whisper.py's whisper_model.transcribe() input.
-    """
+    arr_start = text.find("[")
+    arr_end = text.rfind("]")
+    obj_start = text.find("{")
+    obj_end = text.rfind("}")
+
+    if arr_start != -1 and arr_end != -1 and arr_end > arr_start:
+        return text[arr_start : arr_end + 1]
+    if obj_start != -1 and obj_end != -1 and obj_end > obj_start:
+        return text[obj_start : obj_end + 1]
+    return None
+
+
+def _normalize_payloads(data):
+    """Accept one object or list of objects — same as test_voice_all_whisper."""
+    items = data if isinstance(data, list) else [data]
+    normalized = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("kind", "")).strip().lower()
+        target = str(item.get("target", "")).strip()
+        slang = str(item.get("lol_slang_line", "")).strip()
+        if kind not in ("chat", "status_report"):
+            continue
+        if not slang:
+            continue
+        normalized.append(
+            {
+                "kind": kind,
+                "target": target,
+                "lol_slang_line": slang,
+            }
+        )
+    return normalized
+
+
+def analyze_voice_to_payloads(raw_text: str):
+    """OpenAI → JSON list — aligned with test_voice_all_whisper.analyze_voice_to_structured_json."""
+    if not openai_client:
+        print("[警告] 無 OpenAI client，使用原始文字。")
+        return [{"kind": "chat", "target": "", "lol_slang_line": raw_text}]
+
+    hero_list = "\n".join(f"    {i+1}. {h}" for i, h in enumerate(ENEMIES))
+
+    prompt = f"""你是台灣《英雄聯盟》(LOL) 高端玩家與通訊分類器。
+請根據「使用者語音轉寫」判斷是單一事件還是多個事件：
+- 單一事件：輸出一個 JSON 物件
+- 多個事件：輸出 JSON 陣列，每個元素一個事件
+
+【輸出規則】
+1. 只輸出 JSON，不要 markdown、不要說明、不要前後文字。
+2. 每個事件必須包含鍵：kind, target, lol_slang_line。
+3. 欄位：
+   - kind：chat | status_report
+   - target：這句話的主要目標（英雄/玩家/路線/物件），例如「阿璃」；若無明確目標請填空字串
+   - lol_slang_line：台服極簡術語一行（極短、無多餘標點，符合遊戲內打字習慣）
+4. 術語與糾錯沿用台服習慣（江山/较少→交閃語境、大爷→打野、没伞→沒閃、小时→消失、车队→撤退等）。
+5. 範例1：
+   使用者語音轉寫：「阿璃沒有瞬移」
+   請輸出：
+   {{
+       "kind": "status_report",
+       "target": "阿璃",
+       "lol_slang_line": "阿璃沒閃"
+   }}
+   範例2:
+   使用者語音轉寫：「阿卡麗在上路草叢」
+   請輸出：
+   {{
+       "kind": "chat",
+       "target": "阿卡麗",
+       "lol_slang_line": "阿卡麗在上草"
+   }}
+
+6. 可用英雄名稱（優先使用以下中文名稱，避免拼音/英文）：
+   {CHARACTER_NAMES_PROMPT}
+7. 本場敵方英雄（status_report 的 target 優先對應此清單）：
+{hero_list}
+8. 可用技能名稱（優先使用以下名稱做糾錯與歸一化）：
+   {SKILL_NAMES_PROMPT}
+
+使用者語音轉寫：
+「{raw_text}」"""
+
+    try:
+        response = openai_client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=512,
+            temperature=0.2,
+            timeout=OPENAI_TIMEOUT_SECONDS,
+        )
+        raw = (response.choices[0].message.content or "").strip()
+        blob = _extract_json_blob(raw)
+        if not blob:
+            raise ValueError("無法從模型回覆中擷取 JSON")
+        data = json.loads(blob)
+        payloads = _normalize_payloads(data)
+        if not payloads:
+            raise ValueError("JSON 內容沒有有效事件")
+        return payloads
+    except Exception as e:
+        print(f"[結構化 JSON 失敗，改用純文字後備] {e}")
+        slang = _rewrite_with_llm(raw_text)
+        return [{"kind": "chat", "target": "", "lol_slang_line": slang}]
+
+
+def run_message_pipeline(payloads):
+    """Write pipeline_payload.json and run message_classifier.py — same as test_voice_all_whisper."""
+    for idx, payload in enumerate(payloads, start=1):
+        PIPELINE_JSON_PATH.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        print(f"  [Pipeline] JSON({idx}/{len(payloads)}) → {PIPELINE_JSON_PATH.name}")
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(CLASSIFIER_SCRIPT_PATH),
+                str(PIPELINE_JSON_PATH),
+                "--rpi-ip",
+                RPI_IP,
+                "--rpi-port",
+                str(UDP_PORT),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=CLASSIFIER_TIMEOUT_SECONDS,
+        )
+        if result.stdout.strip():
+            print(result.stdout.strip())
+        if result.returncode != 0:
+            if result.stderr.strip():
+                print(result.stderr.strip())
+            print(f"⚠️ message_classifier 失敗 (exit {result.returncode})")
+
+
+def voice_analysis_pipeline(audio_np: np.ndarray):
+    """float32 audio → Whisper → OpenAI → message_classifier (Loupedeck / RPi / game)."""
     try:
         t0 = time.time()
 
@@ -482,27 +951,18 @@ def voice_analysis_pipeline(audio_np: np.ndarray):
                     print(f"  ⚠️ 燈號失敗: {e}")
                 break
 
-        # Step 2: OpenAI structured JSON + routing
-        t1 = time.time()
-        payload = _analyze_voice(text)
-        print(f"[AI] {json.dumps(payload, ensure_ascii=False)}  ({time.time() - t1:.1f}s)")
+        # Step 2: OpenAI structured JSON → message_classifier.py (matches test_voice_all_whisper)
+        if not openai_client:
+            print("[警告] 無 OpenAI client，略過結構化路由。")
+            return
 
-        _route_payload(payload)
+        t1 = time.time()
+        payloads = analyze_voice_to_payloads(text)
+        print(f"[AI] {json.dumps(payloads, ensure_ascii=False)}  ({time.time() - t1:.1f}s)")
+        run_message_pipeline(payloads)
 
     except Exception as e:
         print(f"語音分析錯誤: {e}")
-
-
-def _extract_json_object(text: str):
-    text = text.strip()
-    fence = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text, re.IGNORECASE)
-    if fence:
-        text = fence.group(1).strip()
-    start = text.find("{")
-    end   = text.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        return None
-    return text[start:end + 1]
 
 
 def _rewrite_with_llm(raw_text: str) -> str:
@@ -530,109 +990,6 @@ def _rewrite_with_llm(raw_text: str) -> str:
     except Exception as e:
         print(f"[LLM fallback 失敗] {e}")
         return raw_text
-
-
-def _analyze_voice(raw_text: str) -> dict:
-    """Call OpenAI to produce structured JSON (same prompt as test_voice_all_whisper.py)."""
-    if not openai_client:
-        print("[警告] 無 OpenAI client，使用原始文字。")
-        return {"kind": "chat", "target": "", "lol_slang_line": raw_text}
-
-    hero_list = "\n".join(f"    {i+1}. {h}" for i, h in enumerate(ENEMIES))
-
-    prompt = f"""你是台灣《英雄聯盟》(LOL) 高端玩家與通訊分類器。請根據「使用者語音轉寫」產出**一個** JSON 物件。
-
-【輸出規則】
-1. 只輸出 JSON，不要 markdown、不要說明、不要前後文字。
-2. 必須包含鍵：kind, target, lol_slang_line。
-3. 欄位：
-   - kind：chat | status_report
-   - target：這句話的主要目標（英雄/玩家/路線/物件）；若無明確目標請填空字串
-   - lol_slang_line：台服極簡術語一行（極短、無多餘標點，符合遊戲內打字習慣）
-4. 術語與糾錯沿用台服習慣（江山/较少→交閃語境、大爷→打野、没伞→沒閃、小时→消失、车队→撤退等）。
-5. 範例：
-   語音轉寫：「阿璃沒有瞬移」 → {{"kind": "status_report", "target": "阿璃", "lol_slang_line": "阿璃沒閃"}}
-   語音轉寫：「阿卡麗在上路草叢」 → {{"kind": "chat", "target": "阿卡麗", "lol_slang_line": "阿卡麗在上草"}}
-6. 當提到某個敵方英雄的技能/召喚師技能狀態時，kind = status_report。
-7. 敵方英雄名單（target 請完全符合此名單中的名字）：
-{hero_list}
-
-使用者語音轉寫：「{raw_text}」"""
-
-    try:
-        response = openai_client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=512,
-            temperature=0.2,
-            timeout=OPENAI_TIMEOUT_SECONDS,
-        )
-        raw  = (response.choices[0].message.content or "").strip()
-        blob = _extract_json_object(raw)
-        if not blob:
-            raise ValueError("無法從模型回覆中擷取 JSON")
-        data = json.loads(blob)
-        if not isinstance(data, dict):
-            raise ValueError("根節點必須為 JSON 物件")
-        return data
-    except Exception as e:
-        print(f"[結構化 JSON 失敗，改用純文字後備] {e}")
-        slang = _rewrite_with_llm(raw_text)
-        return {"kind": "chat", "target": "", "lol_slang_line": slang}
-
-
-def _route_payload(payload: dict):
-    kind   = payload.get("kind",           "").lower()
-    target = payload.get("target",         "")
-    slang  = payload.get("lol_slang_line", "")
-
-    if kind == "status_report" and target:
-        skill = _infer_skill(slang)
-        alert_json = json.dumps({
-            "which character": target,
-            "which skill":     skill,
-            "lol_slang_line":  slang,
-        }, ensure_ascii=False)
-        sock.sendto(f"CMD:ENEMY_ALERT:{alert_json}".encode("utf-8"), (RPI_IP, UDP_PORT))
-
-        timer_id = _hero_to_timer_id(target)
-        if timer_id is not None:
-            signal = (f"START{timer_id}T" if skill == "teleport" else
-                      f"START{timer_id}F" if skill == "flash"    else
-                      f"START{timer_id}")
-            _send_local_signal(signal)
-            print(f"📤 Alert: {target} ({skill}) → 倒數 {signal}")
-
-    elif kind == "chat" and slang:
-        try:
-            import keyboard as kb
-            kb.send("enter")
-            time.sleep(0.3)
-            kb.write(slang, delay=0.05)
-            time.sleep(0.2)
-            kb.send("enter")
-            print(f"💬 遊戲訊息: {slang}")
-        except Exception as e:
-            print(f"⚠️ 訊息發送失敗: {e}")
-
-
-def _infer_skill(slang_line: str) -> str:
-    s = slang_line.lower()
-    if "沒閃" in slang_line or "无闪" in slang_line or "交閃" in slang_line or "no flash" in s:
-        return "flash"
-    if "沒傳" in slang_line or "沒tp" in s or "no tp" in s or "傳送" in slang_line:
-        return "teleport"
-    if "沒大" in slang_line or "no r" in s:
-        return "ultimate"
-    if "沒治" in slang_line:
-        return "heal"
-    if "沒淨化" in slang_line:
-        return "cleanse"
-    if "沒點燃" in slang_line or "沒引燃" in slang_line:
-        return "ignite"
-    if "沒虛弱" in slang_line:
-        return "exhaust"
-    return "flash"
 
 
 def _hero_to_timer_id(hero_name: str):
@@ -667,13 +1024,11 @@ def _preload():
     print("✅ Whisper 模型載入完畢！")
 
 
-# Start background threads
-threading.Thread(target=_preload,         daemon=True).start()
-threading.Thread(target=ipc_listener,     daemon=True).start()
+# Voice to RPi + IPC + RX first; LoL live fetch blocks analysis until in-game.
+threading.Thread(target=ipc_listener, daemon=True).start()
 threading.Thread(target=receive_and_play, daemon=True).start()
-threading.Thread(target=vad_loop,         daemon=True).start()
+threading.Thread(target=win_ptt_listener, daemon=True).start()
 
-# Open always-on mic stream
 mic_stream = sd.InputStream(
     samplerate=RATE,
     channels=CHANNELS,
@@ -682,7 +1037,37 @@ mic_stream = sd.InputStream(
     callback=_mic_callback,
 )
 mic_stream.start()
-print("🎤 麥克風已啟用 (always-on, VAD 自動偵測語音)")
+print("🎤 麥克風已啟用 (broadcast 至 RPi；Live Client 同步完成後才可 Win 鍵觸發分析)")
+
+live_sync_ok = False
+try:
+    live_sync_ok = wait_for_live_client_and_sync()
+except KeyboardInterrupt:
+    is_running = False
+    print("\n已取消等待 Live Client。")
+
+if not is_running or not live_sync_ok:
+    try:
+        mic_stream.stop()
+        mic_stream.close()
+    except Exception:
+        pass
+    stream_out.stop()
+    stream_out.close()
+    sock.close()
+    try:
+        PID_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
+    print("系統已安全關閉。")
+    sys.exit(0)
+
+reload_runtime_config_from_disk()
+send_config_to_plugin()
+print(f"🎮 場次設定已更新: {MY_HERO} vs {', '.join(ENEMIES)}")
+
+liveinfo_ready.set()
+threading.Thread(target=_preload, daemon=True).start()
 
 try:
     print("\n✅ 系統已啟動！")
@@ -692,9 +1077,9 @@ try:
     print("│  [Ally4] [Enemy1][Enemy2]                    │")
     print("│  [Enemy3][Enemy4][Enemy5]                    │")
     print("│                                              │")
-    print("│  麥克風常開 — 直接說話即可                    │")
+    print("│  麥克風常開 — UDP 語音獨立運作                │")
     print("│  按盟友按鈕 → 切換語音路由目標               │")
-    print("│  說敵方資訊 → VAD 偵測 → Whisper → AI → 倒數 │")
+    print("│  按一下 Win 鍵 → 錄音(≤3s) → Whisper → AI    │")
     print("└─────────────────────────────────────────────┘")
     while is_running:
         time.sleep(1.0)

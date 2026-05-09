@@ -3,15 +3,15 @@
     "myTeam": [
         {
             "isMe": true,
-            "champion": "阿卡莉",
-            "spell1": "閃現",
+            "champion": "索娜",
+            "spell1": "鬼步",
             "spell2": "治療"
         },
         {
             "isMe": false,
-            "champion": "麗珊卓",
+            "champion": "古拉格斯",
             "spell1": "閃現",
-            "spell2": "傳送"
+            "spell2": "重擊"
         },
         {
             "isMe": false,
@@ -21,9 +21,9 @@
         },
         {
             "isMe": false,
-            "champion": "路西恩",
-            "spell1": "光盾",
-            "spell2": "閃現"
+            "champion": "墨菲特",
+            "spell1": "閃現",
+            "spell2": "傳送"
         },
         {
             "isMe": false,
@@ -35,33 +35,33 @@
     "theirTeam": [
         {
             "isMe": false,
-            "champion": "布里茨",
-            "spell1": "閃現",
-            "spell2": "點燃"
-        },
-        {
-            "isMe": false,
-            "champion": "加里歐",
+            "champion": "麗珊卓",
             "spell1": "閃現",
             "spell2": "傳送"
         },
         {
             "isMe": false,
-            "champion": "賽特",
+            "champion": "魔甘娜",
             "spell1": "閃現",
             "spell2": "點燃"
         },
         {
             "isMe": false,
-            "champion": "莉莉亞",
+            "champion": "墨菲特",
             "spell1": "閃現",
             "spell2": "重擊"
         },
         {
             "isMe": false,
-            "champion": "史矛德",
-            "spell1": "光盾",
+            "champion": "卡爾瑟斯",
+            "spell1": "虛弱",
             "spell2": "閃現"
+        },
+        {
+            "isMe": false,
+            "champion": "古拉格斯",
+            "spell1": "閃現",
+            "spell2": "傳送"
         }
     ]
 }

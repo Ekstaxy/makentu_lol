@@ -26,9 +26,13 @@ while True:
         data, addr = sock.recvfrom(8192)
 
         # 1. 處理註冊封包 (例如收到 b'HELLO:MID')
+        #    同一個 UDP 端點若改身分，先移除舊 role，避免密語路由仍指向過時鍵
         if data.startswith(b'HELLO:'):
             role = data.split(b':')[1].decode('utf-8').strip()
             with clients_lock:
+                old_role = addr_to_role.get(addr)
+                if old_role is not None and old_role != role:
+                    clients.pop(old_role, None)
                 clients[role] = addr
                 addr_to_role[addr] = role
                 online = list(clients.keys())

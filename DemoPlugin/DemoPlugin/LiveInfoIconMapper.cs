@@ -163,10 +163,19 @@ namespace Loupedeck.DemoPlugin
             {
                 var candidates = new[]
                 {
+                    // Mirror from lol_live_info.py: %LocalAppData%\...\LiveInfo\champion|spell\
+                    Path.Combine(root, "champion", $"{imageBaseName}.png"),
+                    Path.Combine(root, "champion", $"{imageBaseName}.PNG"),
+                    Path.Combine(root, "spell", $"{imageBaseName}.png"),
+                    Path.Combine(root, "spell", $"{imageBaseName}.PNG"),
                     Path.Combine(root, "characters", $"{imageBaseName}.png"),
                     Path.Combine(root, "characters", $"{imageBaseName}.PNG"),
                     Path.Combine(root, "skills", $"{imageBaseName}.png"),
                     Path.Combine(root, "skills", $"{imageBaseName}.PNG"),
+                    Path.Combine(root, "lol_character", "info", "champion", $"{imageBaseName}.png"),
+                    Path.Combine(root, "lol_character", "info", "champion", $"{imageBaseName}.PNG"),
+                    Path.Combine(root, "lol_character", "info", "spell", $"{imageBaseName}.png"),
+                    Path.Combine(root, "lol_character", "info", "spell", $"{imageBaseName}.PNG"),
                 };
 
                 foreach (var c in candidates)
@@ -198,6 +207,20 @@ namespace Loupedeck.DemoPlugin
         private static List<String> ResolveImagesRootCandidates()
         {
             var roots = new List<String>();
+
+            // Same folder lol_live_info.py mirrors into (must be tried before bundled plugin/images).
+            var local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            if (!String.IsNullOrEmpty(local))
+            {
+                roots.Add(Path.Combine(local, "Logi", "LogiPluginService", "LiveInfo"));
+            }
+
+            var repoDir = Environment.GetEnvironmentVariable("LOL_REPO_DIR");
+            if (!String.IsNullOrEmpty(repoDir))
+            {
+                roots.Add(Path.Combine(repoDir, "DemoPlugin", "DemoPlugin", "images"));
+            }
+
             var baseDir = AppContext.BaseDirectory;
             roots.Add(Path.Combine(baseDir, "images"));
             roots.Add(Path.Combine(baseDir, "DemoPlugin", "images"));
@@ -228,12 +251,23 @@ namespace Loupedeck.DemoPlugin
 
         private static String ResolveLiveInfoJsonPath()
         {
-            var baseDir = AppContext.BaseDirectory;
-            var candidates = new List<String>
+            var candidates = new List<String>();
+
+            var localPath = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            if (!String.IsNullOrEmpty(localPath))
             {
-                Path.Combine(baseDir, "images", "lol_character", "info", "lol_live_info.json"),
-                Path.Combine(baseDir, "DemoPlugin", "images", "lol_character", "info", "lol_live_info.json"),
-            };
+                candidates.Add(Path.Combine(localPath, "Logi", "LogiPluginService", "LiveInfo", "lol_live_info.json"));
+            }
+
+            var repoDir = Environment.GetEnvironmentVariable("LOL_REPO_DIR");
+            if (!String.IsNullOrEmpty(repoDir))
+            {
+                candidates.Add(Path.Combine(repoDir, "DemoPlugin", "DemoPlugin", "images", "lol_character", "info", "lol_live_info.json"));
+            }
+
+            var baseDir = AppContext.BaseDirectory;
+            candidates.Add(Path.Combine(baseDir, "images", "lol_character", "info", "lol_live_info.json"));
+            candidates.Add(Path.Combine(baseDir, "DemoPlugin", "images", "lol_character", "info", "lol_live_info.json"));
 
             var cursor = new DirectoryInfo(baseDir);
             for (var i = 0; i < 10 && cursor != null; i++)
@@ -245,15 +279,25 @@ namespace Loupedeck.DemoPlugin
 
             candidates.Add(Path.Combine("/Users/caesar/Desktop/actions-sdk", "DemoPlugin", "DemoPlugin", "images", "lol_character", "info", "lol_live_info.json"));
 
+            // Prefer newest file — bundled plugin copy is often stale; Python updates LiveInfo mirror.
+            String best = null;
+            var bestTime = DateTime.MinValue;
             foreach (var c in candidates)
             {
-                if (File.Exists(c))
+                if (!File.Exists(c))
                 {
-                    return c;
+                    continue;
+                }
+
+                var t = File.GetLastWriteTimeUtc(c);
+                if (t >= bestTime)
+                {
+                    bestTime = t;
+                    best = c;
                 }
             }
 
-            return String.Empty;
+            return best ?? String.Empty;
         }
     }
 }

@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import socket
 import time
 from pathlib import Path
@@ -29,22 +30,35 @@ HERO_TIMER_MAP = {
     "索娜": 10,
 }
 
-LIVE_INFO_JSON_CANDIDATES = [
-    Path(__file__).resolve().parent / "DemoPlugin" / "DemoPlugin" / "images" / "lol_character" / "info" / "lol_live_info.json",
-    Path(__file__).resolve().parent / "images" / "lol_character" / "info" / "lol_live_info.json",
-]
+TACTICAL_CONFIG_PATH = Path(__file__).resolve().parent / "tactical_config.json"
 
 SKILL_SYNONYMS = {
-    "flash": {"flash", "閃現", "没闪", "沒閃"},
+    "flash": {"flash", "閃現", "没闪", "沒閃", "沒瞬移", "沒神"},
     "teleport": {"teleport", "tp", "傳送", "没传", "沒傳"},
     "heal": {"heal", "治療", "治癒"},
     "cleanse": {"cleanse", "淨化"},
     "barrier": {"barrier", "光盾"},
-    "ignite": {"ignite", "點燃"},
+    "ignite": {"ignite", "點燃", "點人"},
     "smite": {"smite", "重擊"},
     "ghost": {"ghost", "鬼步"},
     "exhaust": {"exhaust", "虛弱"},
 }
+
+
+def _live_info_candidate_paths() -> list[Path]:
+    """All lol_live_info.json locations; freshest file wins in _resolve_live_info_path."""
+    base = Path(__file__).resolve().parent
+    paths: list[Path] = [
+        base / "DemoPlugin" / "DemoPlugin" / "images" / "lol_character" / "info" / "lol_live_info.json",
+        base / "images" / "lol_character" / "info" / "lol_live_info.json",
+        base / "lol_character" / "info" / "lol_live_info.json",
+    ]
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        paths.append(
+            Path(local) / "Logi" / "LogiPluginService" / "LiveInfo" / "lol_live_info.json"
+        )
+    return paths
 
 
 def _get_field(payload: Dict[str, Any], key: str, default: str = "") -> str:
@@ -72,6 +86,8 @@ def _infer_skill(payload: Dict[str, Any], slang_line: str) -> str:
                 return value.strip()
 
     normalized = slang_line.lower()
+    if "交閃" in slang_line or "交闪现" in slang_line:
+        return "flash"
     if "沒閃" in slang_line or "无闪" in slang_line or "no flash" in normalized:
         return "flash"
     if "沒大" in slang_line or "no r" in normalized:
@@ -96,6 +112,60 @@ def _infer_skill(payload: Dict[str, Any], slang_line: str) -> str:
     return "unknown"
 
 
+def _live_slot_skill_channel(info: Dict[str, Any], inferred: str) -> tuple[int, str | None]:
+    timer_id = int(info["timer_id"])
+    s1 = _normalize_skill_text(str(info.get("spell1", "")))
+    s2 = _normalize_skill_text(str(info.get("spell2", "")))
+
+    if inferred and inferred == s1:
+        return timer_id, "flash"
+    if inferred and inferred == s2:
+        return timer_id, "teleport"
+    if inferred == "teleport":
+        return timer_id, "teleport"
+    if inferred == "flash":
+        return timer_id, "flash"
+    return timer_id, None
+
+
+def _fuzzy_live_match(target: str, live: Dict[str, Dict[str, Any]]) -> Dict[str, Any] | None:
+    if target in live:
+        return live[target]
+    best_key = None
+    best_score = 0
+    for k in live:
+        if not k:
+            continue
+        if len(target) >= 2 and (target in k or k in target):
+            score = min(len(k), len(target))
+            if score > best_score:
+                best_score = score
+                best_key = k
+    return live.get(best_key) if best_key else None
+
+
+def _enemy_slot_from_tactical_config(target: str) -> int | None:
+    if not TACTICAL_CONFIG_PATH.is_file():
+        return None
+    try:
+        data = json.loads(TACTICAL_CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    enemies = data.get("enemies")
+    if not isinstance(enemies, list):
+        return None
+    t = target.strip()
+    for i, name in enumerate(enemies[:5]):
+        if not isinstance(name, str):
+            continue
+        n = name.strip()
+        if not n:
+            continue
+        if t == n or (len(t) >= 2 and (t in n or n in t)):
+            return i + 1
+    return None
+
+
 def _normalize_skill_text(text: str) -> str:
     raw = (text or "").strip().lower()
     if not raw:
@@ -108,10 +178,19 @@ def _normalize_skill_text(text: str) -> str:
 
 
 def _resolve_live_info_path() -> Path | None:
-    for p in LIVE_INFO_JSON_CANDIDATES:
-        if p.exists():
-            return p
-    return None
+    best = None
+    best_t = -1.0
+    for p in _live_info_candidate_paths():
+        if not p.is_file():
+            continue
+        try:
+            t = p.stat().st_mtime
+        except OSError:
+            continue
+        if t >= best_t:
+            best_t = t
+            best = p
+    return best
 
 
 def _read_live_slot_map() -> Dict[str, Dict[str, Any]]:
@@ -170,46 +249,45 @@ def _read_live_slot_map() -> Dict[str, Dict[str, Any]]:
 
 def _resolve_timer_and_skill_channel(target: str, inferred_skill: str) -> tuple[int | None, str | None]:
     """
-    Resolve countdown target from live icon mapping.
-    Returns (timer_id, channel) where channel is:
-      - 'flash' -> slot1 countdown
-      - 'teleport' -> slot2 countdown
-      - None -> default countdown channel
+    Resolve countdown target from lol_live_info, then tactical_config enemies,
+    then HERO_TIMER_MAP. Returns (timer_id, cd_channel) where channel is
+    'flash' -> STARTnF, 'teleport' -> STARTnT, None -> STARTn legacy.
     """
     target = (target or "").strip()
-    inferred = _normalize_skill_text(inferred_skill)
+    inferred = _normalize_skill_text(str(inferred_skill or ""))
+
     if not target:
         return None, None
 
     live = _read_live_slot_map()
-    if target in live:
-        info = live[target]
-        timer_id = int(info["timer_id"])
 
-        s1 = _normalize_skill_text(str(info.get("spell1", "")))
-        s2 = _normalize_skill_text(str(info.get("spell2", "")))
+    info = None
+    if live:
+        if target in live:
+            info = live[target]
+        else:
+            info = _fuzzy_live_match(target, live)
 
-        if inferred and inferred == s1:
-            return timer_id, "flash"      # top slot
-        if inferred and inferred == s2:
-            return timer_id, "teleport"   # bottom slot
+    if info is not None:
+        return _live_slot_skill_channel(info, inferred)
 
-        # Backward-compatible fallback: direct flash/tp semantics.
+    slot = _enemy_slot_from_tactical_config(target)
+    if slot is not None:
+        if inferred == "teleport":
+            return slot, "teleport"
+        if inferred == "flash":
+            return slot, "flash"
+        return slot, None
+
+    timer_id = HERO_TIMER_MAP.get(target)
+    if timer_id is not None:
         if inferred == "teleport":
             return timer_id, "teleport"
         if inferred == "flash":
             return timer_id, "flash"
         return timer_id, None
 
-    # Fallback to legacy static map if live JSON mapping unavailable.
-    timer_id = HERO_TIMER_MAP.get(target)
-    if timer_id is None:
-        return None, None
-    if inferred == "teleport":
-        return timer_id, "teleport"
-    if inferred == "flash":
-        return timer_id, "flash"
-    return timer_id, None
+    return None, None
 
 
 def _send_udp_json(host: str, port: int, payload: Dict[str, Any]) -> None:
@@ -272,11 +350,21 @@ def classify_and_route(
 
         # 3) Trigger mapped skill cooldown for this target based on live icon mapping.
         timer_id, cd_skill = _resolve_timer_and_skill_channel(target, skill)
-        if timer_id is not None and (cd_skill is not None or skill in ("flash", "teleport")):
+        effective = cd_skill
+        if timer_id is not None:
+            if effective is None and skill == "flash":
+                effective = "flash"
+            elif effective is None and skill == "teleport":
+                effective = "teleport"
+
+        countdown_ok = timer_id is not None and (
+            effective is not None or skill in ("flash", "teleport")
+        )
+        if countdown_ok:
             _send_countdown_start(
-                countdown_host, countdown_port, timer_id, skill=cd_skill
+                countdown_host, countdown_port, timer_id, skill=effective
             )
-            suffix = "T" if cd_skill == "teleport" else ("F" if cd_skill == "flash" else "")
+            suffix = "T" if effective == "teleport" else ("F" if effective == "flash" else "")
             print(
                 f"Sent countdown START{timer_id}{suffix or ''} (skill={skill}) for target {target}"
             )
@@ -314,15 +402,19 @@ def main() -> None:
     args = parser.parse_args()
 
     with open(args.json_file, "r", encoding="utf-8") as f:
-        payload = json.load(f)
+        data = json.load(f)
 
-    classify_and_route(
-        payload=payload,
-        rpi_ip=args.rpi_ip,
-        rpi_port=args.rpi_port,
-        countdown_host=args.countdown_host,
-        countdown_port=args.countdown_port,
-    )
+    items = data if isinstance(data, list) else [data]
+    for item in items:
+        if not isinstance(item, dict):
+            raise ValueError("pipeline JSON must be an object or an array of objects")
+        classify_and_route(
+            payload=item,
+            rpi_ip=args.rpi_ip,
+            rpi_port=args.rpi_port,
+            countdown_host=args.countdown_host,
+            countdown_port=args.countdown_port,
+        )
 
 
 if __name__ == "__main__":

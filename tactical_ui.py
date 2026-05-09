@@ -65,7 +65,7 @@ ALL_HEROES = [
 # ── Shared state ────────────────────────────────────────────────
 selected_role = None
 selected_my_hero = None
-server_ip = "172.20.10.2"
+server_ip = "10.10.31.138"
 server_port = 5005
 enemy_selections = [""] * 5   # 5 enemy hero slots
 
