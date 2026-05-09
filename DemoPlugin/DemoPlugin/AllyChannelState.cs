@@ -1,25 +1,30 @@
 namespace Loupedeck.DemoPlugin
 {
     using System;
-    using System.Collections.Generic;
-    using System.Linq;
+    using System.Timers;
 
     /// <summary>
-    /// Manages the current voice target (single ally or ALL),
-    /// and stores role/hero configuration received from the PC UI.
+    /// Manages ally channel communication state (multi-select).
+    /// Default: all channels enabled.
+    /// Presses are debounced in a 0.5s selection window.
     /// </summary>
     internal static class AllyChannelState
     {
         public const Int32 AllySlotCount = 4;  // 5v5: 4 allies
         public const Int32 EnemySlotCount = 5;  // 5 enemies
+        private const Double SelectionWindowMs = 500;
 
         private static readonly Object LockObject = new Object();
+        private static readonly Timer CommitTimer;
 
         // Slot index (0-3) → role name ("JG", "MID", …). Empty string = unassigned.
         private static readonly String[] AllyRoles = new String[AllySlotCount];
 
-        // Current voice target: null/"" = broadcast ALL, otherwise a role name.
-        private static String _currentTarget = "";
+        // Current committed communication state (true = green / receives voice).
+        private static readonly Boolean[] ActiveChannels = new Boolean[AllySlotCount];
+        // Pending state during the 0.5 second press window.
+        private static readonly Boolean[] PendingChannels = new Boolean[AllySlotCount];
+        private static Boolean HasPendingSelection;
 
         // Enemy slots (0-4) → hero name.
         private static readonly String[] EnemyHeroes = new String[EnemySlotCount];
@@ -30,8 +35,16 @@ namespace Loupedeck.DemoPlugin
 
         static AllyChannelState()
         {
+            CommitTimer = new Timer(SelectionWindowMs);
+            CommitTimer.AutoReset = false;
+            CommitTimer.Elapsed += (_, __) => CommitPendingSelection();
+
             for (var i = 0; i < AllySlotCount; i++)
+            {
                 AllyRoles[i] = "";
+                ActiveChannels[i] = true;
+                PendingChannels[i] = true;
+            }
             for (var i = 0; i < EnemySlotCount; i++)
                 EnemyHeroes[i] = "";
         }
@@ -91,55 +104,126 @@ namespace Loupedeck.DemoPlugin
             lock (LockObject) { return EnemyHeroes[idx]; }
         }
 
-        // ── Voice Target (single target, not a set) ────────────────
+        // ── Ally channel communication set (multi target) ───────────
 
         /// <summary>
-        /// Toggle target for a specific ally slot.
-        /// If currently targeting this ally → revert to ALL.
-        /// If currently targeting another ally or ALL → switch to this ally.
+        /// Toggle communication for a specific ally slot.
+        /// Selection is committed after 0.5s; multiple presses in the window are grouped.
         /// </summary>
         public static void ToggleTarget(Int32 slot)
         {
             var idx = ValidateSlot(slot, AllySlotCount);
             lock (LockObject)
             {
-                var role = AllyRoles[idx];
-                if (String.IsNullOrEmpty(role))
-                    return;
+                if (!HasPendingSelection)
+                {
+                    var allGreen = true;
+                    for (var i = 0; i < AllySlotCount; i++)
+                    {
+                        if (!ActiveChannels[i])
+                        {
+                            allGreen = false;
+                            break;
+                        }
+                    }
 
-                if (_currentTarget == role)
-                    _currentTarget = "";  // back to broadcast
-                else
-                    _currentTarget = role;  // switch to this ally
+                    if (allGreen)
+                    {
+                        // Requirement: when all are green, first press starts selection mode.
+                        // Start from all blue, then pressed allies become green during 0.5s window.
+                        for (var i = 0; i < AllySlotCount; i++)
+                        {
+                            PendingChannels[i] = false;
+                        }
+                    }
+                    else
+                    {
+                        // Normal mode: start from current committed state.
+                        Array.Copy(ActiveChannels, PendingChannels, AllySlotCount);
+                    }
+
+                    HasPendingSelection = true;
+                }
+
+                PendingChannels[idx] = !PendingChannels[idx];
+                CommitTimer.Stop();
+                CommitTimer.Start();
             }
-            RaiseStateChanged(0); // refresh all buttons
+            RaiseStateChanged(0); // Refresh all buttons immediately.
         }
 
         /// <summary>Force broadcast mode (ALL).</summary>
         public static void ClearTarget()
         {
-            lock (LockObject) { _currentTarget = ""; }
+            lock (LockObject)
+            {
+                for (var i = 0; i < AllySlotCount; i++)
+                {
+                    ActiveChannels[i] = true;
+                    PendingChannels[i] = true;
+                }
+
+                HasPendingSelection = false;
+                CommitTimer.Stop();
+            }
             RaiseStateChanged(0);
         }
 
-        /// <summary>Current target role, or empty string for broadcast ALL.</summary>
+        /// <summary>
+        /// Current legacy target role. Empty string means ALL (or multi-target) for compatibility.
+        /// </summary>
         public static String GetCurrentTarget()
         {
-            lock (LockObject) { return _currentTarget; }
+            return String.Empty;
         }
 
-        /// <summary>True if the specified slot is the current voice target.</summary>
+        /// <summary>True = green (receives voice), false = blue (muted).</summary>
         public static Boolean IsTargeted(Int32 slot)
         {
             var idx = ValidateSlot(slot, AllySlotCount);
             lock (LockObject)
             {
-                return !String.IsNullOrEmpty(_currentTarget)
-                    && _currentTarget == AllyRoles[idx];
+                return HasPendingSelection ? PendingChannels[idx] : ActiveChannels[idx];
             }
         }
 
         // ── Helpers ────────────────────────────────────────────────
+
+        private static void CommitPendingSelection()
+        {
+            lock (LockObject)
+            {
+                if (!HasPendingSelection)
+                {
+                    return;
+                }
+
+                Array.Copy(PendingChannels, ActiveChannels, AllySlotCount);
+                HasPendingSelection = false;
+
+                // Requirement: if all channels are closed, auto-reset to ALL enabled.
+                var anyEnabled = false;
+                for (var i = 0; i < AllySlotCount; i++)
+                {
+                    if (ActiveChannels[i])
+                    {
+                        anyEnabled = true;
+                        break;
+                    }
+                }
+
+                if (!anyEnabled)
+                {
+                    for (var i = 0; i < AllySlotCount; i++)
+                    {
+                        ActiveChannels[i] = true;
+                        PendingChannels[i] = true;
+                    }
+                }
+            }
+
+            RaiseStateChanged(0);
+        }
 
         private static Int32 ValidateSlot(Int32 slot, Int32 max)
         {

@@ -2,6 +2,9 @@ namespace Loupedeck.DemoPlugin
 {
     using System;
     using System.Collections.Generic;
+    using System.Net.Sockets;
+    using System.Text;
+    using System.Timers;
 
     /// <summary>
     /// Base class for the 5 enemy hero buttons on the Creative Console.
@@ -10,6 +13,11 @@ namespace Loupedeck.DemoPlugin
     /// </summary>
     public abstract class CountdownTimerCommandBase : PluginDynamicCommand
     {
+        private const Int32 LocalIpcPort = 5006;
+        private const Int32 AllyTimerStart = 6;
+        private const Int32 AllyTimerEnd = 9;
+        private static readonly Timer IconRefreshTimer;
+        private static event Action RefreshTick;
         private static readonly String[] CharacterNamesByTimerId =
         {
             "蓋倫",
@@ -17,13 +25,27 @@ namespace Loupedeck.DemoPlugin
             "好運姐",
             "阿姆姆",
             "雷歐娜",
+            "墨菲特",
+            "馬爾札哈",
+            "艾希",
+            "沃維克",
+            "索娜",
         };
+
+        static CountdownTimerCommandBase()
+        {
+            IconRefreshTimer = new Timer(1000);
+            IconRefreshTimer.AutoReset = true;
+            IconRefreshTimer.Elapsed += (_, __) => RefreshTick?.Invoke();
+            IconRefreshTimer.Start();
+        }
 
         private readonly Int32 _timerId;
         private readonly Dictionary<Int32, String> _frameResources = new Dictionary<Int32, String>();
         private readonly Byte[] _characterImageBytes;
         private readonly Byte[] _topSkillImageBytes;
         private readonly Byte[] _bottomSkillImageBytes;
+        private readonly UdpClient _udpClient = new UdpClient();
 
         protected CountdownTimerCommandBase(Int32 timerId, String displayName)
             : base(displayName: displayName, description: "閃現 / 傳送 各一組倒數", groupName: "Timers")
@@ -56,6 +78,8 @@ namespace Loupedeck.DemoPlugin
             }
 
             CountdownState.StateChanged += this.OnCountdownStateChanged;
+            AllyChannelState.StateChanged += this.OnAllyChannelStateChanged;
+            RefreshTick += this.OnRefreshTick;
             if (this._timerId == 1)
             {
                 SignalBlockState.StateChanged += this.OnSignalStateChanged;
@@ -93,6 +117,14 @@ namespace Loupedeck.DemoPlugin
 
         protected override void RunCommand(String actionParameter)
         {
+            if (TryGetAllySlot(this._timerId, out var allySlot))
+            {
+                // Ally slots are communication toggles; countdown starts only from UDP signals.
+                AllyChannelState.ToggleTarget(allySlot);
+                SendIpcToggle(allySlot);
+                return;
+            }
+
             CountdownState.StartCountdown(this._timerId, CountdownSkill.Flash);
         }
 
@@ -106,19 +138,46 @@ namespace Loupedeck.DemoPlugin
             var (fSec, fRun) = CountdownState.GetSnapshot(this._timerId, CountdownSkill.Flash);
             var (tSec, tRun) = CountdownState.GetSnapshot(this._timerId, CountdownSkill.Teleport);
             var overlayKey = SignalBlockState.GetOverlayKey();
+            Boolean? allyChannelActive = null;
+            if (TryGetAllySlot(this._timerId, out var allySlot))
+            {
+                allyChannelActive = AllyChannelState.IsTargeted(allySlot);
+            }
 
-            if (this._characterImageBytes != null && this._characterImageBytes.Length > 0)
+            var characterBytes = this._characterImageBytes;
+            var topSkillBytes = this._topSkillImageBytes;
+            var bottomSkillBytes = this._bottomSkillImageBytes;
+            if (LiveInfoIconMapper.TryGetSlotResources(this._timerId, out var liveChampion, out var liveSpell1, out var liveSpell2))
+            {
+                if (liveChampion != null)
+                {
+                    characterBytes = liveChampion;
+                }
+
+                if (liveSpell1 != null)
+                {
+                    topSkillBytes = liveSpell1;
+                }
+
+                if (liveSpell2 != null)
+                {
+                    bottomSkillBytes = liveSpell2;
+                }
+            }
+
+            if (characterBytes != null && characterBytes.Length > 0)
             {
                 var composed = SkillCountdownImageComposer.TryBuild(
                     this._timerId,
-                    this._characterImageBytes,
-                    this._topSkillImageBytes,
-                    this._bottomSkillImageBytes,
+                    characterBytes,
+                    topSkillBytes,
+                    bottomSkillBytes,
                     fSec,
                     fRun,
                     tSec,
                     tRun,
-                    overlayKey);
+                    overlayKey,
+                    allyChannelActive);
                 if (composed != null)
                 {
                     return composed;
@@ -150,12 +209,47 @@ namespace Loupedeck.DemoPlugin
             return null;
         }
 
+        private void SendIpcToggle(Int32 slotId)
+        {
+            try
+            {
+                var msg = $"PTT_ALLY{slotId}_TOGGLE";
+                var data = Encoding.UTF8.GetBytes(msg);
+                this._udpClient.Send(data, data.Length, "127.0.0.1", LocalIpcPort);
+            }
+            catch
+            {
+                // UI toggle still works without local IPC.
+            }
+        }
+
         private void OnCountdownStateChanged(Int32 changedTimerId)
         {
             if (changedTimerId == this._timerId)
             {
                 this.ActionImageChanged();
             }
+        }
+
+        private void OnAllyChannelStateChanged(Int32 changedSlot)
+        {
+            if (TryGetAllySlot(this._timerId, out var allySlot)
+                && (changedSlot == 0 || changedSlot == allySlot))
+            {
+                this.ActionImageChanged();
+            }
+        }
+
+        private static Boolean TryGetAllySlot(Int32 timerId, out Int32 allySlot)
+        {
+            if (timerId >= AllyTimerStart && timerId <= AllyTimerEnd)
+            {
+                allySlot = timerId - AllyTimerStart + 1; // timer 6..9 -> ally slot 1..4
+                return true;
+            }
+
+            allySlot = 0;
+            return false;
         }
 
         private void OnSignalStateChanged()
@@ -166,15 +260,12 @@ namespace Loupedeck.DemoPlugin
             }
         }
 
-        private void OnConfigChanged(Int32 slot)
+        private void OnRefreshTick()
         {
-            // When enemy config changes, reload the hero image.
-            TryLoadCharacterImage();
             this.ActionImageChanged();
         }
-    }
 
-    // ── 5 enemy hero timer buttons ──────────────────────────────
+    }
 
     public class CountdownTimer1Command : CountdownTimerCommandBase
     {

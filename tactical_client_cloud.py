@@ -75,6 +75,12 @@ is_running = True
 ptt_active = False
 current_target = ""   # "" = broadcast ALL, otherwise a role name like "JG"
 audio_buffer = []     # buffered audio chunks for Whisper
+state_lock = threading.Lock()
+
+# Ally channel communication state (mirrors plugin behavior).
+enabled_ally_slots = set(range(1, len(ALLIES) + 1))  # default all green
+pending_ally_slots = set(enabled_ally_slots)
+selection_window_deadline = 0.0
 
 # =====================================================================
 # ⚙️  Audio setup
@@ -153,17 +159,39 @@ def ipc_listener():
     ipc_sock.settimeout(1.0)
     print(f"🔌 IPC 伺服器已啟動 (Port: {LOCAL_IPC_PORT})，等待 Logi Console 指令...")
 
-    global ptt_active, current_target, audio_buffer
+    global ptt_active, current_target, audio_buffer, pending_ally_slots, selection_window_deadline, enabled_ally_slots
+
+    def _commit_pending_if_due(now_ts: float) -> None:
+        nonlocal ipc_sock
+        global pending_ally_slots, selection_window_deadline, enabled_ally_slots
+        if selection_window_deadline <= 0 or now_ts < selection_window_deadline:
+            return
+        with state_lock:
+            committed = set(pending_ally_slots)
+            # Rule: if none selected, reset to all green (broadcast to all allies).
+            if not committed:
+                committed = set(range(1, len(ALLIES) + 1))
+            enabled_ally_slots = committed
+            selection_window_deadline = 0.0
+            role_names = [ALLIES[i - 1] for i in sorted(enabled_ally_slots) if 1 <= i <= len(ALLIES)]
+        print(f"🧭 Ally channels committed: {role_names if role_names else 'ALL'}")
 
     while is_running:
         try:
+            _commit_pending_if_due(time.time())
             data, _ = ipc_sock.recvfrom(1024)
             msg = data.decode("utf-8").strip()
 
             if msg == "PTT_START":
                 ptt_active = True
                 audio_buffer = []
-                target_display = current_target if current_target else "ALL"
+                with state_lock:
+                    if len(enabled_ally_slots) == len(ALLIES):
+                        target_display = "ALL"
+                    else:
+                        target_display = ",".join(
+                            ALLIES[i - 1] for i in sorted(enabled_ally_slots) if 1 <= i <= len(ALLIES)
+                        )
                 print(f"\n🎤 [目標: {target_display}] 🟢 開始錄音...")
 
             elif msg == "PTT_STOP":
@@ -183,19 +211,27 @@ def ipc_listener():
                 try:
                     slot = int(msg.replace("PTT_ALLY", "").replace("_TOGGLE", ""))
                     if 1 <= slot <= len(ALLIES):
-                        role = ALLIES[slot - 1]
-                        if current_target == role:
-                            current_target = ""
-                            print(f"📡 [{role}] 取消密語 → 廣播模式 (ALL)")
-                        else:
-                            current_target = role
-                            print(f"🤫 [{role}] 切換密語 → 語音只發給 {role}")
+                        with state_lock:
+                            # Start 0.5s grouping window.
+                            if selection_window_deadline <= 0:
+                                all_green = len(enabled_ally_slots) == len(ALLIES)
+                                pending_ally_slots = set() if all_green else set(enabled_ally_slots)
+
+                            if slot in pending_ally_slots:
+                                pending_ally_slots.remove(slot)
+                            else:
+                                pending_ally_slots.add(slot)
+                            selection_window_deadline = time.time() + 0.5
                 except ValueError:
                     pass
 
             # Legacy PTT_JG_START / PTT_ALL_START support
             elif msg == "PTT_ALL_START":
                 ptt_active = True
+                with state_lock:
+                    enabled_ally_slots = set(range(1, len(ALLIES) + 1))
+                    pending_ally_slots = set(enabled_ally_slots)
+                    selection_window_deadline = 0.0
                 current_target = ""
                 audio_buffer = []
                 print("\n🎤 [全頻廣播] 🟢 開始！")
@@ -209,6 +245,7 @@ def ipc_listener():
                 print(f"❓ 未知指令: {msg}")
 
         except socket.timeout:
+            _commit_pending_if_due(time.time())
             continue
         except Exception as e:
             if is_running:
@@ -275,10 +312,20 @@ def record_and_send():
 
             audio_buffer.append(audio_data)
 
-            # Single target routing
-            target = current_target if current_target else "ALL"
-            header = target.ljust(4)[:4].encode("utf-8")
-            sock.sendto(header + audio_data, (RPI_IP, UDP_PORT))
+            with state_lock:
+                active_slots = set(enabled_ally_slots)
+
+            if len(active_slots) >= len(ALLIES):
+                # Broadcast once
+                header = "ALL".ljust(4)[:4].encode("utf-8")
+                sock.sendto(header + audio_data, (RPI_IP, UDP_PORT))
+            else:
+                # Send to each selected ally role
+                for slot in sorted(active_slots):
+                    if 1 <= slot <= len(ALLIES):
+                        role = ALLIES[slot - 1]
+                        header = role.ljust(4)[:4].encode("utf-8")
+                        sock.sendto(header + audio_data, (RPI_IP, UDP_PORT))
 
         except Exception as e:
             if is_running:

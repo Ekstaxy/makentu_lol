@@ -1,8 +1,15 @@
 namespace Loupedeck.DemoPlugin
 {
     using System;
+    using System.IO;
     using System.Net.Sockets;
+    using System.Numerics;
     using System.Text;
+    using SixLabors.Fonts;
+    using SixLabors.ImageSharp;
+    using SixLabors.ImageSharp.Drawing.Processing;
+    using SixLabors.ImageSharp.PixelFormats;
+    using SixLabors.ImageSharp.Processing;
 
     /// <summary>
     /// Base class for the 4 ally channel buttons on the Creative Console.
@@ -12,6 +19,7 @@ namespace Loupedeck.DemoPlugin
     public abstract class AllyChannelCommandBase : PluginDynamicCommand
     {
         private const Int32 LOCAL_IPC_PORT = 5006;
+        private static readonly Font UiFont = ResolveFont();
         private readonly Int32 _slotId; // 1-based (1-4)
         private UdpClient _udpClient;
 
@@ -25,7 +33,7 @@ namespace Loupedeck.DemoPlugin
 
         protected override void RunCommand(String actionParameter)
         {
-            // Toggle: if currently targeting this ally → ALL, else → this ally
+            // Toggle this channel in a 0.5s grouped selection window.
             AllyChannelState.ToggleTarget(this._slotId);
 
             // Send IPC to Python client
@@ -36,28 +44,74 @@ namespace Loupedeck.DemoPlugin
 
         protected override String GetCommandDisplayName(String actionParameter, PluginImageSize imageSize)
         {
-            var role = AllyChannelState.GetAllyRole(this._slotId);
-            var label = String.IsNullOrEmpty(role) ? $"Ally {this._slotId}" : role;
-            var active = AllyChannelState.IsTargeted(this._slotId);
-            return active ? $"🎤 {label}" : label;
+            return String.Empty;
         }
 
         protected override BitmapImage GetCommandImage(String actionParameter, PluginImageSize imageSize)
         {
             var role = AllyChannelState.GetAllyRole(this._slotId);
-            if (!String.IsNullOrEmpty(role))
+            var active = AllyChannelState.IsTargeted(this._slotId);
+            var bg = active ? new Rgba32(0, 170, 70, 255) : new Rgba32(0, 95, 200, 255);
+            var label = String.IsNullOrEmpty(role) ? $"A{this._slotId}" : role;
+
+            try
             {
-                try
+                using var canvas = new Image<Rgba32>(100, 100, bg);
+                canvas.Mutate(ctx =>
                 {
-                    var fileName = $"{role.ToLower()}_channel.png";
-                    var resourcePath = PluginResources.FindFile(fileName);
-                    return PluginResources.ReadImage(resourcePath);
-                }
-                catch
+                    // subtle border for readability on hardware
+                    ctx.Draw(Color.Black.WithAlpha(0.35f), 2, new RectangleF(1, 1, 98, 98));
+                    if (UiFont != null)
+                    {
+                        var textOptions = new TextOptions(UiFont);
+                        var bounds = TextMeasurer.MeasureBounds(label, textOptions);
+                        var x = (100 - bounds.Width) / 2f - bounds.Left;
+                        var y = (100 - bounds.Height) / 2f - bounds.Top;
+                        ctx.DrawText(label, UiFont, Color.White, new Vector2(x, y));
+                    }
+                });
+
+                using var ms = new MemoryStream();
+                canvas.SaveAsPng(ms);
+                var bytes = ms.ToArray();
+                return BitmapImage.TryCreateFromArray(bytes, out var bmp) ? bmp : null;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static Font ResolveFont()
+        {
+            try
+            {
+                var fc = new FontCollection();
+                var paths = OperatingSystem.IsMacOS()
+                    ? new[]
+                    {
+                        "/Library/Fonts/Arial.ttf",
+                        "/System/Library/Fonts/Supplemental/Arial.ttf",
+                        "/System/Library/Fonts/Helvetica.ttc",
+                    }
+                    : new[] { @"C:\Windows\Fonts\arial.ttf" };
+
+                foreach (var path in paths)
                 {
-                    // No role-specific image; fall through to default.
+                    if (!File.Exists(path))
+                    {
+                        continue;
+                    }
+
+                    var family = fc.Add(path);
+                    return family.CreateFont(20f, FontStyle.Bold);
                 }
             }
+
+            catch
+            {
+            }
+
             return null;
         }
 
