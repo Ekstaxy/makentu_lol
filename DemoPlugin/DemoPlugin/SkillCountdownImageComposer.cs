@@ -57,7 +57,8 @@ namespace Loupedeck.DemoPlugin
             Boolean flashRunning,
             Int32 teleportSeconds,
             Boolean teleportRunning,
-            String signalOverlayKey)
+            String signalOverlayKey,
+            Boolean? allyChannelActive)
         {
             Image<Rgba32> character;
             try
@@ -92,9 +93,11 @@ namespace Loupedeck.DemoPlugin
 
                 try
                 {
-                    var bgColor = timerId >= 1 && timerId <= 5
-                        ? new Rgba32(180, 20, 20, 255)
-                        : new Rgba32(0, 0, 0, 0);
+                    var bgColor = allyChannelActive.HasValue
+                        ? (allyChannelActive.Value ? new Rgba32(0, 170, 70, 255) : new Rgba32(0, 95, 200, 255))
+                        : (timerId >= 1 && timerId <= 5
+                            ? new Rgba32(180, 20, 20, 255)
+                            : new Rgba32(0, 0, 0, 0));
                     using var framed = ApplyInsetScale(image, 0.95f, bgColor);
                     using var ms = new MemoryStream();
                     framed.SaveAsPng(ms);
