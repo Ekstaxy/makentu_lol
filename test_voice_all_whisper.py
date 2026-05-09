@@ -11,16 +11,18 @@ import keyboard
 import whisper # 🌟 引入 Whisper
 from openai import OpenAI
 
+from openai_key_util import load_openai_api_key
+
 # ==========================================
-# ⚙️ 1. 設定 OpenAI API
+# ⚙️ 1. 設定 OpenAI API（OPENAI_API_KEY 環境變數，或專案根目錄 .env）
 # ==========================================
-API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+BASE_DIR = Path(__file__).resolve().parent
+API_KEY = load_openai_api_key(base_dir=BASE_DIR).strip()
 MODEL_NAME = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 if not API_KEY:
-    print("\n[錯誤] 請先設定環境變數 OPENAI_API_KEY")
+    print("\n[錯誤] 請設定 OPENAI_API_KEY（環境變數）或在專案根目錄建立 .env")
     sys.exit(1)
 openai_client = OpenAI(api_key=API_KEY)
-BASE_DIR = Path(__file__).resolve().parent
 PIPELINE_JSON_PATH = BASE_DIR / "pipeline_payload.json"
 CLASSIFIER_SCRIPT_PATH = BASE_DIR / "message_classifier.py"
 OPENAI_TIMEOUT_SECONDS = 12

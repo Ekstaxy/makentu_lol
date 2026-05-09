@@ -13,13 +13,45 @@ After setup, writes tactical_config.json and launches tactical_client_cloud.py.
 Can be compiled to .exe with: pyinstaller --onefile --windowed tactical_ui.py
 """
 
+import atexit
 import json
+import os
+import signal
 import subprocess
 import sys
 import tkinter as tk
 from pathlib import Path
 from tkinter import font as tkfont, messagebox
 from PIL import Image, ImageTk
+
+# ── Global subprocess tracking ──────────────────────────────────
+_child_proc = None
+_normal_exit = False  # True when UI exits normally after launching child
+
+def _cleanup_child():
+    """Kill the tactical_client_cloud.py subprocess only on abnormal exit."""
+    global _child_proc
+    if _normal_exit:
+        return  # Child should keep running after UI closes normally
+    if _child_proc is not None:
+        try:
+            _child_proc.terminate()
+            _child_proc.wait(timeout=3)
+        except Exception:
+            try:
+                _child_proc.kill()
+            except Exception:
+                pass
+        _child_proc = None
+
+atexit.register(_cleanup_child)
+
+def _signal_handler(sig, frame):
+    _cleanup_child()
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, _signal_handler)
+signal.signal(signal.SIGTERM, _signal_handler)
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "tactical_config.json"
@@ -331,10 +363,12 @@ class ObsScreen(tk.Frame):
         CONFIG_PATH.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"Config saved to {CONFIG_PATH}")
 
-        # Launch tactical_client.py
+        # Launch tactical_client_cloud.py and track it for cleanup
+        global _child_proc, _normal_exit
         client_script = BASE_DIR / "tactical_client_cloud.py"
-        subprocess.Popen([sys.executable, str(client_script)], cwd=str(BASE_DIR))
-        messagebox.showinfo("啟動成功", "系統已啟動！")
+        _child_proc = subprocess.Popen([sys.executable, str(client_script)], cwd=str(BASE_DIR))
+        _normal_exit = True
+        messagebox.showinfo("啟動成功", "系統已經啟動，UI 將關閉")
         self.controller.destroy()
 # ═══════════════════════════════════════════════════════════════════
 #  Screen: IntroScreen
@@ -411,4 +445,10 @@ class IntroScreen(tk.Frame):
 # ═══════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     app = TacticalApp()
-    app.mainloop()
+    app.protocol("WM_DELETE_WINDOW", lambda: (_cleanup_child(), app.destroy()))
+    try:
+        app.mainloop()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        _cleanup_child()

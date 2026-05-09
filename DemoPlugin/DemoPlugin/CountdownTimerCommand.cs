@@ -84,36 +84,9 @@ namespace Loupedeck.DemoPlugin
             {
                 SignalBlockState.StateChanged += this.OnSignalStateChanged;
             }
-
-            // Listen for dynamic config changes to update hero image.
-            AllyChannelState.StateChanged += this.OnConfigChanged;
         }
 
-        private void TryLoadCharacterImage()
-        {
-            // First try dynamic config.
-            var heroName = AllyChannelState.GetEnemyHero(this._timerId);
 
-            // Fallback to static list.
-            if (String.IsNullOrEmpty(heroName)
-                && this._timerId >= 1
-                && this._timerId <= FallbackHeroNames.Length)
-            {
-                heroName = FallbackHeroNames[this._timerId - 1];
-            }
-
-            if (!String.IsNullOrEmpty(heroName))
-            {
-                try
-                {
-                    this._characterResourcePath = PluginResources.FindFile($"{heroName}_skills.png");
-                }
-                catch
-                {
-                    this._characterResourcePath = null;
-                }
-            }
-        }
 
         protected override void RunCommand(String actionParameter)
         {
