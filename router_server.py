@@ -6,11 +6,6 @@ UDP_IP = "0.0.0.0"
 UDP_PORT = 5005
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-try:
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
-except OSError:
-    pass
 sock.bind((UDP_IP, UDP_PORT))
 
 # 🌟 身份字典：用來對應 "位置代號" -> (IP, Port)
