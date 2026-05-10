@@ -10,67 +10,67 @@
         },
         {
             "isMe": false,
-            "champion": "賽特",
-            "spell1": "閃現",
-            "spell2": "點燃",
-            "position": "TOP"
-        },
-        {
-            "isMe": false,
-            "champion": "拉姆斯",
+            "champion": "塔隆",
             "spell1": "鬼步",
             "spell2": "重擊",
             "position": "JUNGLE"
         },
         {
             "isMe": false,
-            "champion": "維迦",
-            "spell1": "閃現",
-            "spell2": "傳送",
-            "position": "MIDDLE"
-        },
-        {
-            "isMe": false,
-            "champion": "潘森",
+            "champion": "布里茨",
             "spell1": "閃現",
             "spell2": "點燃",
             "position": "UTILITY"
-        }
-    ],
-    "theirTeam": [
-        {
-            "isMe": false,
-            "champion": "納瑟斯",
-            "spell1": "鬼步",
-            "spell2": "傳送",
-            "position": "TOP"
         },
         {
             "isMe": false,
-            "champion": "悟空",
-            "spell1": "閃現",
-            "spell2": "重擊",
-            "position": "JUNGLE"
-        },
-        {
-            "isMe": false,
-            "champion": "伊瑞莉雅",
-            "spell1": "閃現",
-            "spell2": "點燃",
-            "position": "MIDDLE"
-        },
-        {
-            "isMe": false,
-            "champion": "卡莎碧雅",
+            "champion": "路西恩",
             "spell1": "光盾",
             "spell2": "閃現",
             "position": "BOTTOM"
         },
         {
             "isMe": false,
-            "champion": "睿娜妲‧格萊斯克",
+            "champion": "枷蘿",
             "spell1": "閃現",
-            "spell2": "治療",
+            "spell2": "重擊",
+            "position": "JUNGLE"
+        }
+    ],
+    "theirTeam": [
+        {
+            "isMe": false,
+            "champion": "漢默丁格",
+            "spell1": "閃現",
+            "spell2": "傳送",
+            "position": "MIDDLE"
+        },
+        {
+            "isMe": false,
+            "champion": "易大師",
+            "spell1": "閃現",
+            "spell2": "重擊",
+            "position": "JUNGLE"
+        },
+        {
+            "isMe": false,
+            "champion": "好運姐",
+            "spell1": "光盾",
+            "spell2": "閃現",
+            "position": "BOTTOM"
+        },
+        {
+            "isMe": false,
+            "champion": "弗力貝爾",
+            "spell1": "閃現",
+            "spell2": "點燃",
+            "position": "TOP"
+        },
+        {
+            "isMe": false,
+            "champion": "布郎姆",
+            "spell1": "閃現",
+            "spell2": "點燃",
             "position": "UTILITY"
         }
     ]

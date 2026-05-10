@@ -1027,23 +1027,91 @@ def audio_mixer_loop():
             pass
 
 
+# Lane keyword → canonical lane name (mirrors message_classifier logic).
+_LANE_CANON: dict[str, str] = {
+    "中路": "MIDDLE", "中單": "MIDDLE",
+    "打野": "JUNGLE", "野區": "JUNGLE",
+    "上路": "TOP",    "上單": "TOP",
+    "下路": "BOTTOM", "射手": "BOTTOM",
+    "輔助": "UTILITY", "下路輔": "UTILITY",
+    "mid": "MIDDLE", "middle": "MIDDLE",
+    "jungle": "JUNGLE", "jg": "JUNGLE",
+    "bot": "BOTTOM", "bottom": "BOTTOM", "adc": "BOTTOM",
+    "sup": "UTILITY", "support": "UTILITY", "utility": "UTILITY",
+    "top": "TOP",
+}
+_LANE_POS_ALIASES: dict[str, frozenset[str]] = {
+    "MIDDLE":  frozenset({"MIDDLE", "MID", "MIDDLELANE", "MIDLANER"}),
+    "JUNGLE":  frozenset({"JUNGLE", "JG", "JGL", "JUNGLER", "JUN"}),
+    "TOP":     frozenset({"TOP"}),
+    "BOTTOM":  frozenset({"BOTTOM", "BOT", "ADC", "DUO", "DUOCARRY"}),
+    "UTILITY": frozenset({"UTILITY", "SUPPORT", "SUP"}),
+}
+
+
+def _resolve_lane_from_live(hero: str, skill: str) -> tuple[int | None, str]:
+    """Resolve a lane-role keyword to a timer_id by reading the live JSON directly.
+
+    This does NOT import message_classifier so it is safe to call from any thread
+    without risking the keyboard-hook side effects that can raise ImportError.
+    """
+    canon = _LANE_CANON.get(hero) or _LANE_CANON.get(hero.lower())
+    if not canon:
+        return None, skill
+
+    accepted = _LANE_POS_ALIASES.get(canon, frozenset())
+
+    candidates: list[Path] = []
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        candidates.append(
+            Path(local) / "Logi" / "LogiPluginService" / "LiveInfo" / "lol_live_info.json"
+        )
+    candidates.append(
+        BASE_DIR / "DemoPlugin" / "DemoPlugin" / "info" / "lol_character" / "info" / "lol_live_info.json"
+    )
+
+    for p in candidates:
+        try:
+            if not p.is_file():
+                continue
+            data = json.loads(p.read_text(encoding="utf-8"))
+            for idx, player in enumerate(data.get("theirTeam", [])[:5], 1):
+                pos = (
+                    player.get("teamPosition") or player.get("individualPosition")
+                    or player.get("position") or player.get("lane") or ""
+                )
+                norm = pos.upper().replace(" ", "").replace("_", "")
+                if any(norm == a.replace("_", "").replace(" ", "") for a in accepted):
+                    return idx, skill
+        except Exception:
+            continue
+    return None, skill
+
+
 def _resolve_remote_alert_timer(hero: str, skill: str) -> tuple[int | None, str]:
     """Resolve timer_id + effective skill for a remote CMD:ENEMY_ALERT.
 
-    First tries the fast path (direct ENEMIES list match), then falls back to
-    message_classifier._resolve_timer_and_skill_channel which understands both
-    champion names and lane-role phrases like 中路 / 打野 / TOP etc.
+    Resolution order:
+      1. Direct ENEMIES list match (fastest, no I/O).
+      2. Lane-role keyword → live JSON lookup (no message_classifier import needed).
+      3. Fuzzy champion match via message_classifier (full resolution).
     """
+    # 1. Fast path: hero name is in our ENEMIES list.
     timer_id = _hero_to_timer_id(hero)
     if timer_id is not None:
         return timer_id, skill
 
-    # Lane-name / fuzzy champion resolution via message_classifier (same logic
-    # used by the sender when it built the alert).
+    # 2. Lane keyword resolution directly from the live JSON.
+    tid, resolved_skill = _resolve_lane_from_live(hero, skill)
+    if tid is not None:
+        return tid, resolved_skill
+
+    # 3. Fuzzy champion / full resolution via message_classifier.
     try:
         import message_classifier as _mc
-        tid, resolved_skill = _mc._resolve_timer_and_skill_channel(hero, skill)
-        return tid, (resolved_skill or skill)
+        tid, cd_skill = _mc._resolve_timer_and_skill_channel(hero, skill)
+        return tid, (cd_skill or skill)
     except Exception:
         return None, skill
 

@@ -389,6 +389,21 @@ def _read_live_slot_map() -> Dict[str, Dict[str, Any]]:
     return result
 
 
+def _slot_from_live_by_timer_id(
+    live: Dict[str, Dict[str, Any]], timer_id: int, inferred_skill: str
+) -> str | None:
+    """Search the live slot map by timer_id to find which spell slot inferred_skill occupies.
+
+    Used when champion-name lookup fails but tactical_config / HERO_TIMER_MAP has already
+    resolved the timer_id — we still want the correct F/T suffix for the broadcast signal.
+    """
+    for info in live.values():
+        if int(info.get("timer_id", -1)) == timer_id:
+            _, channel = _live_slot_skill_channel(info, inferred_skill)
+            return channel
+    return None
+
+
 def _resolve_timer_and_skill_channel(target: str, inferred_skill: str) -> tuple[int | None, str | None]:
     """
     Resolve countdown target from lol_live_info (champion match, then lane phrase vs enemy positions),
@@ -423,7 +438,10 @@ def _resolve_timer_and_skill_channel(target: str, inferred_skill: str) -> tuple[
             return slot, "teleport"
         if inferred == "flash":
             return slot, "flash"
-        return slot, None
+        # Champion name lookup failed, but we know the timer_id.
+        # Search live map by timer_id to get the correct spell slot for this skill.
+        channel = _slot_from_live_by_timer_id(live, slot, inferred)
+        return slot, channel
 
     timer_id = HERO_TIMER_MAP.get(target)
     if timer_id is not None:
@@ -431,7 +449,8 @@ def _resolve_timer_and_skill_channel(target: str, inferred_skill: str) -> tuple[
             return timer_id, "teleport"
         if inferred == "flash":
             return timer_id, "flash"
-        return timer_id, None
+        channel = _slot_from_live_by_timer_id(live, timer_id, inferred)
+        return timer_id, channel
 
     return None, None
 
@@ -512,8 +531,13 @@ def classify_and_route(
             elif effective is None and skill == "teleport":
                 effective = "teleport"
 
+        # Send the countdown signal whenever we have a timer_id AND the skill is a
+        # recognised summoner spell (not "unknown").  Previously only flash/teleport
+        # were allowed, which meant ignite/barrier/ghost/etc. never sent a START
+        # signal → the broadcast had no "signal" field → teammates received the
+        # wrong spell slot (STARTn defaults to top/flash slot).
         countdown_ok = timer_id is not None and (
-            effective is not None or skill in ("flash", "teleport")
+            effective is not None or skill in SKILL_SYNONYMS
         )
         if countdown_ok:
             _send_countdown_start(
@@ -523,8 +547,14 @@ def classify_and_route(
             print(
                 f"Sent countdown START{timer_id}{suffix or ''} (skill={skill}) for target {target}"
             )
+            # When the spell slot couldn't be determined (effective is None), still show
+            # the slang text in the overlay so teammates see the announcement.
+            if effective is None and slang:
+                _send_chat_to_game(slang, overlay_host, overlay_port)
+                if overlay_port > 0:
+                    print(f"Sent to PiP overlay: {slang}")
         else:
-            # Debug fallback: if character/skill mapping is missing, treat as chat.
+            # No timer_id resolved at all — treat as chat so text reaches the overlay.
             if slang:
                 print(
                     f"[Fallback->chat] no countdown mapping for target='{target}' skill='{skill}', sending chat."
