@@ -224,13 +224,89 @@ def _read_live_json_dict() -> Dict[str, Any] | None:
         return None
 
 
+def _extract_lane_token(raw: str) -> str:
+    """Reduce API values like 'lane.mid', 'POSITION_JG', 'mid' to a compact UPPER token."""
+    s = str(raw).strip()
+    if not s:
+        return ""
+    # Use last segment for dotted / path-like values (Riot clients vary).
+    for sep in (".", "/", "\\"):
+        if sep in s:
+            s = s.rsplit(sep, 1)[-1]
+    u = s.upper().replace(" ", "").replace("_", "").replace("-", "")
+    for prefix in ("LANE", "POSITION", "ROLE", "TEAM", "INDIVIDUAL"):
+        if len(u) > len(prefix) and u.startswith(prefix):
+            u = u[len(prefix) :]
+            break
+    return u
+
+
 def _normalize_riot_lane(raw: str) -> str | None:
-    """Map Live Client position strings to canonical lane keys (aligned with tactical_client_cloud)."""
+    """Map Live Client position strings to canonical lane keys (aligned with tactical_client_cloud).
+
+    TW/CN clients often emit *Chinese* labels in teamPosition / lane (e.g. 中路, 打野).
+    Riot also emits compact *letter* codes: mid, jg, jng, top, bot, sup (sometimes nested in
+    keys like lane.mid). Previously only English was recognised, so lane-based status_report never matched an
+    enemy row → no timer_id → no 'Sent countdown' line → broadcast had no signal field.
+    """
     if not raw:
         return None
-    u = str(raw).strip().upper().replace(" ", "").replace("_", "")
-    if u in ("NONE", "INVALID", "LANE_NONE", ""):
+    s = str(raw).strip()
+    if not s:
         return None
+    if s.upper() in ("NONE", "INVALID", "LANE_NONE"):
+        return None
+
+    # Exact Chinese labels (most common from Live Client on zh-TW).
+    zh_exact = {
+        "中路": "MIDDLE",
+        "中單": "MIDDLE",
+        "打野": "JUNGLE",
+        "野區": "JUNGLE",
+        "上路": "TOP",
+        "上單": "TOP",
+        "下路": "BOTTOM",
+        "射手": "BOTTOM",
+        "輔助": "UTILITY",
+        "下路輔": "UTILITY",
+    }
+    if s in zh_exact:
+        return zh_exact[s]
+
+    # Substring match for API strings that mix text (longer phrases first).
+    zh_ordered = [
+        ("下路輔", "UTILITY"),
+        ("中路", "MIDDLE"),
+        ("中單", "MIDDLE"),
+        ("打野", "JUNGLE"),
+        ("野區", "JUNGLE"),
+        ("上路", "TOP"),
+        ("上單", "TOP"),
+        ("下路", "BOTTOM"),
+        ("射手", "BOTTOM"),
+        ("輔助", "UTILITY"),
+    ]
+    for needle, lane in zh_ordered:
+        if needle in s:
+            return lane
+
+    u = _extract_lane_token(s)
+    if not u:
+        return None
+
+    # Compact letter codes from Live Client (mid / jg / jng / top / bot / sup).
+    letter_codes = {
+        "MID": "MIDDLE",
+        "JG": "JUNGLE",
+        "JNG": "JUNGLE",
+        "TOP": "TOP",
+        "BOT": "BOTTOM",
+        "SUP": "UTILITY",
+        "UTL": "UTILITY",
+    }
+    if u in letter_codes:
+        return letter_codes[u]
+
     aliases = {
         "TOP": "TOP",
         "MIDDLE": "MIDDLE",
@@ -253,9 +329,9 @@ def _normalize_riot_lane(raw: str) -> str | None:
     }
     if u in aliases:
         return aliases[u]
-    if "JUNGLE" in u or u in ("JGL", "JG") or u.endswith("JG"):
+    if "JUNGLE" in u or u in ("JGL", "JG", "JNG") or u.endswith("JG"):
         return "JUNGLE"
-    if "MIDDLE" in u or "MIDLANE" in u:
+    if "MIDDLE" in u or "MIDLANE" in u or u.endswith("MID"):
         return "MIDDLE"
     if "BOTTOM" in u or u == "ADC" or ("DUO" in u and "CARRY" in u):
         return "BOTTOM"
@@ -270,6 +346,17 @@ def _canonical_lane_from_target_phrase(target: str) -> str | None:
     if not t:
         return None
     tl = t.lower()
+    # Exact compact codes (same letters Riot uses in JSON).
+    short_lane = {
+        "mid": "MIDDLE",
+        "jg": "JUNGLE",
+        "jng": "JUNGLE",
+        "top": "TOP",
+        "bot": "BOTTOM",
+        "sup": "UTILITY",
+    }
+    if tl in short_lane:
+        return short_lane[tl]
     # Longer / specific substrings first (Chinese).
     zh_checks = [
         ("中路", "MIDDLE"),
@@ -288,13 +375,15 @@ def _canonical_lane_from_target_phrase(target: str) -> str | None:
             return lane
     eng_ordered = [
         ("middle", "MIDDLE"),
-        ("mid", "MIDDLE"),
         ("jungle", "JUNGLE"),
-        ("jg", "JUNGLE"),
         ("bottom", "BOTTOM"),
-        ("adc", "BOTTOM"),
         ("support", "UTILITY"),
         ("utility", "UTILITY"),
+        ("mid", "MIDDLE"),
+        ("jng", "JUNGLE"),
+        ("jg", "JUNGLE"),
+        ("adc", "BOTTOM"),
+        ("bot", "BOTTOM"),
         ("sup", "UTILITY"),
         ("top", "TOP"),
     ]

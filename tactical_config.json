@@ -2,7 +2,7 @@
   "server_ip": "10.10.31.138",
   "server_port": 5005,
   "my_role": "BOT",
-  "my_hero": "墨菲特",
+  "my_hero": "拉姆斯",
   "allies": [
     "JG",
     "TOP",
@@ -10,11 +10,11 @@
     "SUP"
   ],
   "enemies": [
-    "漢默丁格",
-    "易大師",
-    "好運姐",
-    "弗力貝爾",
-    "布郎姆"
+    "薇可絲",
+    "悟空",
+    "索拉卡",
+    "凱爾",
+    "汎"
   ],
   "obs_host": "localhost",
   "obs_port": 4455,

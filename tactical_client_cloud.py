@@ -1031,22 +1031,125 @@ def audio_mixer_loop():
 _LANE_CANON: dict[str, str] = {
     "中路": "MIDDLE", "中單": "MIDDLE",
     "打野": "JUNGLE", "野區": "JUNGLE",
-    "上路": "TOP",    "上單": "TOP",
+    "上路": "TOP", "上單": "TOP",
     "下路": "BOTTOM", "射手": "BOTTOM",
     "輔助": "UTILITY", "下路輔": "UTILITY",
     "mid": "MIDDLE", "middle": "MIDDLE",
-    "jungle": "JUNGLE", "jg": "JUNGLE",
+    "jungle": "JUNGLE", "jg": "JUNGLE", "jng": "JUNGLE",
     "bot": "BOTTOM", "bottom": "BOTTOM", "adc": "BOTTOM",
     "sup": "UTILITY", "support": "UTILITY", "utility": "UTILITY",
     "top": "TOP",
 }
-_LANE_POS_ALIASES: dict[str, frozenset[str]] = {
-    "MIDDLE":  frozenset({"MIDDLE", "MID", "MIDDLELANE", "MIDLANER"}),
-    "JUNGLE":  frozenset({"JUNGLE", "JG", "JGL", "JUNGLER", "JUN"}),
-    "TOP":     frozenset({"TOP"}),
-    "BOTTOM":  frozenset({"BOTTOM", "BOT", "ADC", "DUO", "DUOCARRY"}),
-    "UTILITY": frozenset({"UTILITY", "SUPPORT", "SUP"}),
-}
+
+
+def _extract_lane_token(raw: str) -> str:
+    """Same as message_classifier._extract_lane_token — compact lane.mid → MID."""
+    s = str(raw).strip()
+    if not s:
+        return ""
+    for sep in (".", "/", "\\"):
+        if sep in s:
+            s = s.rsplit(sep, 1)[-1]
+    u = s.upper().replace(" ", "").replace("_", "").replace("-", "")
+    for prefix in ("LANE", "POSITION", "ROLE", "TEAM", "INDIVIDUAL"):
+        if len(u) > len(prefix) and u.startswith(prefix):
+            u = u[len(prefix) :]
+            break
+    return u
+
+
+def _normalize_live_lane_pos(raw: str) -> str | None:
+    """Normalise Riot Live Client lane/position text to the same keys as _LANE_CANON values.
+
+    Must stay in sync with message_classifier._normalize_riot_lane so receiver fallback
+    matches when the JSON uses Chinese labels (中路 / 打野 / …).
+    """
+    if not raw:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    if s.upper() in ("NONE", "INVALID", "LANE_NONE"):
+        return None
+
+    zh_exact = {
+        "中路": "MIDDLE",
+        "中單": "MIDDLE",
+        "打野": "JUNGLE",
+        "野區": "JUNGLE",
+        "上路": "TOP",
+        "上單": "TOP",
+        "下路": "BOTTOM",
+        "射手": "BOTTOM",
+        "輔助": "UTILITY",
+        "下路輔": "UTILITY",
+    }
+    if s in zh_exact:
+        return zh_exact[s]
+
+    zh_ordered = [
+        ("下路輔", "UTILITY"),
+        ("中路", "MIDDLE"),
+        ("中單", "MIDDLE"),
+        ("打野", "JUNGLE"),
+        ("野區", "JUNGLE"),
+        ("上路", "TOP"),
+        ("上單", "TOP"),
+        ("下路", "BOTTOM"),
+        ("射手", "BOTTOM"),
+        ("輔助", "UTILITY"),
+    ]
+    for needle, lane in zh_ordered:
+        if needle in s:
+            return lane
+
+    u = _extract_lane_token(s)
+    if not u:
+        return None
+
+    letter_codes = {
+        "MID": "MIDDLE",
+        "JG": "JUNGLE",
+        "JNG": "JUNGLE",
+        "TOP": "TOP",
+        "BOT": "BOTTOM",
+        "SUP": "UTILITY",
+        "UTL": "UTILITY",
+    }
+    if u in letter_codes:
+        return letter_codes[u]
+
+    aliases = {
+        "TOP": "TOP",
+        "MIDDLE": "MIDDLE",
+        "MID": "MIDDLE",
+        "MIDDLELANE": "MIDDLE",
+        "MIDLANER": "MIDDLE",
+        "JUNGLE": "JUNGLE",
+        "JUNGLER": "JUNGLE",
+        "JG": "JUNGLE",
+        "JGL": "JUNGLE",
+        "JUN": "JUNGLE",
+        "BOTTOM": "BOTTOM",
+        "BOT": "BOTTOM",
+        "ADC": "BOTTOM",
+        "DUO": "BOTTOM",
+        "DUOCARRY": "BOTTOM",
+        "UTILITY": "UTILITY",
+        "SUPPORT": "UTILITY",
+        "SUP": "UTILITY",
+    }
+    if u in aliases:
+        return aliases[u]
+    if "JUNGLE" in u or u in ("JGL", "JG", "JNG") or u.endswith("JG"):
+        return "JUNGLE"
+    if "MIDDLE" in u or "MIDLANE" in u or u.endswith("MID"):
+        return "MIDDLE"
+    if "BOTTOM" in u or u == "ADC" or ("DUO" in u and "CARRY" in u):
+        return "BOTTOM"
+    if "UTILITY" in u or "SUPPORT" in u:
+        return "UTILITY"
+    return None
 
 
 def _resolve_lane_from_live(hero: str, skill: str) -> tuple[int | None, str]:
@@ -1058,8 +1161,6 @@ def _resolve_lane_from_live(hero: str, skill: str) -> tuple[int | None, str]:
     canon = _LANE_CANON.get(hero) or _LANE_CANON.get(hero.lower())
     if not canon:
         return None, skill
-
-    accepted = _LANE_POS_ALIASES.get(canon, frozenset())
 
     candidates: list[Path] = []
     local = os.environ.get("LOCALAPPDATA")
@@ -1081,8 +1182,8 @@ def _resolve_lane_from_live(hero: str, skill: str) -> tuple[int | None, str]:
                     player.get("teamPosition") or player.get("individualPosition")
                     or player.get("position") or player.get("lane") or ""
                 )
-                norm = pos.upper().replace(" ", "").replace("_", "")
-                if any(norm == a.replace("_", "").replace(" ", "") for a in accepted):
+                norm_lane = _normalize_live_lane_pos(str(pos))
+                if norm_lane == canon:
                     return idx, skill
         except Exception:
             continue
