@@ -1,8 +1,8 @@
 {
   "server_ip": "10.10.31.138",
   "server_port": 5005,
-  "my_role": "MID",
-  "my_hero": "凱莎",
+  "my_role": "BOT",
+  "my_hero": "墨菲特",
   "allies": [
     "JG",
     "TOP",
@@ -10,11 +10,11 @@
     "SUP"
   ],
   "enemies": [
-    "賽特",
-    "趙信",
-    "科加斯",
-    "庫奇",
-    "波比"
+    "納瑟斯",
+    "悟空",
+    "伊瑞莉雅",
+    "卡莎碧雅",
+    "睿娜妲‧格萊斯克"
   ],
   "obs_host": "localhost",
   "obs_port": 4455,

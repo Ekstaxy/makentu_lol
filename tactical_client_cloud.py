@@ -1248,36 +1248,23 @@ def _infer_skill_from_slang(slang: str) -> str:
     return "unknown"
 
 
-def _broadcast_enemy_alert(target: str, skill: str) -> None:
+def _broadcast_enemy_alert(target: str, skill: str, pre_signal: str | None = None) -> None:
     """Broadcast CMD:ENEMY_ALERT via the router using the already-registered sock.
 
     message_classifier.py sends this payload in a subprocess with a fresh
     unregistered socket, so the router drops it.  We re-send it here from the
     main registered socket so the router will forward it to all teammates.
 
-    The sender pre-resolves the countdown signal (e.g. START3F) and embeds it
-    in the JSON so that receivers can use it directly without needing their own
-    live-client data or a separate resolution step.
+    pre_signal is the already-resolved countdown string (e.g. 'START3F') parsed
+    directly from message_classifier's stdout.  Embedding it means receivers
+    need no resolution step at all — they just forward it to their local plugin.
     """
     if not target:
         return
     try:
         alert: dict = {"which character": target, "which skill": skill}
-
-        # Pre-resolve on the sender side so every receiver gets a ready-to-use signal.
-        try:
-            import message_classifier as _mc
-            timer_id, cd_skill = _mc._resolve_timer_and_skill_channel(target, skill)
-            if timer_id is not None:
-                effective = cd_skill or skill
-                pre_signal = (
-                    f"START{timer_id}T" if effective == "teleport" else
-                    f"START{timer_id}F" if effective == "flash"    else
-                    f"START{timer_id}"
-                )
-                alert["signal"] = pre_signal
-        except Exception:
-            pass  # receivers will fall back to local resolution
+        if pre_signal:
+            alert["signal"] = pre_signal
 
         packet = ("CMD:ENEMY_ALERT:" + json.dumps(alert, ensure_ascii=False)).encode("utf-8")
         sock.sendto(packet, (RPI_IP, UDP_PORT))
@@ -1319,8 +1306,9 @@ def run_message_pipeline(payloads):
             text=True,
             timeout=CLASSIFIER_TIMEOUT_SECONDS,
         )
-        if result.stdout.strip():
-            print(result.stdout.strip())
+        stdout_text = result.stdout.strip()
+        if stdout_text:
+            print(stdout_text)
         if result.returncode != 0:
             if result.stderr.strip():
                 print(result.stderr.strip())
@@ -1334,7 +1322,18 @@ def run_message_pipeline(payloads):
             target = str(payload.get("target", "")).strip()
             slang  = str(payload.get("lol_slang_line", "")).strip()
             skill  = _infer_skill_from_slang(slang)
-            _broadcast_enemy_alert(target, skill)
+
+            # Parse the pre-resolved countdown signal directly from message_classifier's
+            # printed output (e.g. "Sent countdown START3F (skill=flash) for target 中路").
+            # This is the most reliable source — no re-import, no re-resolution needed,
+            # and it works correctly for both champion names and lane-role phrases.
+            pre_signal: str | None = None
+            if stdout_text:
+                m = re.search(r"Sent countdown (START\d+[TF]?)\b", stdout_text)
+                if m:
+                    pre_signal = m.group(1)
+
+            _broadcast_enemy_alert(target, skill, pre_signal=pre_signal)
 
 
 def voice_analysis_pipeline(audio_np: np.ndarray):
