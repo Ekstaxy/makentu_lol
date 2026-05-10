@@ -1061,6 +1061,16 @@ def handle_incoming_command(data: bytes):
                 return
             hero  = alert.get("which character", "")
             skill = alert.get("which skill", "flash")
+
+            # Fast path: sender pre-resolved the signal, use it directly.
+            # This removes any dependency on the receiver's live-client data.
+            pre_signal = alert.get("signal")
+            if pre_signal and isinstance(pre_signal, str):
+                _send_local_signal(pre_signal)
+                print(f"📥 Remote alert: {hero} ({skill}) → {pre_signal}")
+                return
+
+            # Fallback: resolve locally (handles old broadcast format).
             timer_id, effective_skill = _resolve_remote_alert_timer(hero, skill)
             if timer_id is not None:
                 signal = (f"START{timer_id}T" if effective_skill == "teleport" else
@@ -1244,12 +1254,32 @@ def _broadcast_enemy_alert(target: str, skill: str) -> None:
     message_classifier.py sends this payload in a subprocess with a fresh
     unregistered socket, so the router drops it.  We re-send it here from the
     main registered socket so the router will forward it to all teammates.
+
+    The sender pre-resolves the countdown signal (e.g. START3F) and embeds it
+    in the JSON so that receivers can use it directly without needing their own
+    live-client data or a separate resolution step.
     """
     if not target:
         return
     try:
-        alert   = {"which character": target, "which skill": skill}
-        packet  = ("CMD:ENEMY_ALERT:" + json.dumps(alert, ensure_ascii=False)).encode("utf-8")
+        alert: dict = {"which character": target, "which skill": skill}
+
+        # Pre-resolve on the sender side so every receiver gets a ready-to-use signal.
+        try:
+            import message_classifier as _mc
+            timer_id, cd_skill = _mc._resolve_timer_and_skill_channel(target, skill)
+            if timer_id is not None:
+                effective = cd_skill or skill
+                pre_signal = (
+                    f"START{timer_id}T" if effective == "teleport" else
+                    f"START{timer_id}F" if effective == "flash"    else
+                    f"START{timer_id}"
+                )
+                alert["signal"] = pre_signal
+        except Exception:
+            pass  # receivers will fall back to local resolution
+
+        packet = ("CMD:ENEMY_ALERT:" + json.dumps(alert, ensure_ascii=False)).encode("utf-8")
         sock.sendto(packet, (RPI_IP, UDP_PORT))
         print(f"📤 廣播技能警報給隊友: {alert}")
     except Exception as e:
